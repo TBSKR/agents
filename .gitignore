@@ -27,3 +27,7 @@ archive.zip
 .cache
 .DS_Store
 local_db*
+data/
+historical_data.db
+paper_trading_data/
+install.log
