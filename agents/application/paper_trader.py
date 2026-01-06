@@ -865,8 +865,10 @@ class PaperTrader:
         try:
             start = time.monotonic()
             while time.monotonic() - start < duration_seconds:
+                print(f"[PaperTrader] Checking {len(token_ids)} tokens...")
                 for token_id in token_ids:
                     update = self.market_tracker.get_websocket_update(token_id, max_age_seconds=5)
+                    print(f"[PaperTrader] Got update for {token_id}: {update is not None}")
                     if not update:
                         continue
 
@@ -878,16 +880,19 @@ class PaperTrader:
 
                     market_data = _build_market_data_from_ws(token_id, update)
                     if not market_data:
+                        print(f"[PaperTrader] No market data built for {token_id}")
                         continue
 
                     orders = market_maker.on_market_update(market_data)
                     if not orders:
+                        print(f"[PaperTrader] No orders for {token_id}")
                         continue
 
                     results['orders_generated'] += len(orders)
                     for order in orders:
                         if self._execute_market_maker_order(order, market_data):
                             results['orders_executed'] += 1
+                            print(f"[PaperTrader] Executed {order.side} for {token_id}")
 
                 time.sleep(poll_interval)
         finally:
@@ -1025,12 +1030,16 @@ def _build_market_data_from_ws(token_id: str, update: Any) -> Optional[Dict[str,
     if not update:
         return None
 
-    market_id = None
-    if isinstance(update, dict):
-        market_id = update.get("market") or update.get("asset_id") or update.get("assetId")
+    normalized = _normalize_ws_update(update)
+    if not normalized:
+        _debug_ws_payload(token_id, update)
+        return None
+
+    market_id = normalized.get("market") or normalized.get("asset_id") or normalized.get("assetId")
 
     mid_price = _extract_ws_mid_price(update)
     if mid_price is None:
+        _debug_ws_payload(token_id, update)
         return None
 
     return {
@@ -1038,31 +1047,40 @@ def _build_market_data_from_ws(token_id: str, update: Any) -> Optional[Dict[str,
         "token_id": str(token_id),
         "mid_price": mid_price,
         "price": mid_price,
-        "timestamp": update.get("timestamp") if isinstance(update, dict) else None,
-        "liquidity": update.get("liquidity") if isinstance(update, dict) else None,
-        "volume": update.get("volume") if isinstance(update, dict) else None,
-        "volume_24h": update.get("volume_24h") if isinstance(update, dict) else None,
+        "timestamp": normalized.get("timestamp"),
+        "liquidity": normalized.get("liquidity"),
+        "volume": normalized.get("volume"),
+        "volume_24h": normalized.get("volume_24h"),
     }
 
 
 def _extract_ws_mid_price(update: Any) -> Optional[float]:
-    if isinstance(update, dict) and "price" in update:
+    normalized = _normalize_ws_update(update)
+    if not normalized:
+        return None
+
+    if "price" in normalized:
         try:
-            return float(update["price"])
+            return float(normalized["price"])
         except (TypeError, ValueError):
             return None
 
     price_changes = None
-    if isinstance(update, dict):
-        price_changes = update.get("price_changes") or update.get("priceChanges")
+    price_changes = normalized.get("price_changes") or normalized.get("priceChanges")
     if not price_changes:
         return None
 
     prices = []
     for change in price_changes:
-        if isinstance(change, dict) and "price" in change:
+        if isinstance(change, dict):
+            if "price" in change:
+                try:
+                    prices.append(float(change["price"]))
+                except (TypeError, ValueError):
+                    continue
+        elif isinstance(change, (list, tuple)) and change:
             try:
-                prices.append(float(change["price"]))
+                prices.append(float(change[0]))
             except (TypeError, ValueError):
                 continue
 
@@ -1076,4 +1094,43 @@ def _extract_ws_mid_price(update: Any) -> Optional[float]:
 def _extract_ws_timestamp(update: Any) -> Optional[Any]:
     if isinstance(update, dict):
         return update.get("timestamp")
+    return None
+
+
+_WS_DEBUGGED_TOKENS = set()
+
+
+def _debug_ws_payload(token_id: str, update: Any) -> None:
+    if token_id in _WS_DEBUGGED_TOKENS:
+        return
+    _WS_DEBUGGED_TOKENS.add(token_id)
+    if isinstance(update, list):
+        preview = update[0] if update else None
+        print(f"[PaperTrader] WS payload for {token_id} is list preview={preview}")
+        return
+    if not isinstance(update, dict):
+        print(f"[PaperTrader] WS payload for {token_id} is {type(update)}")
+        return
+    event_type = update.get("event_type") or update.get("eventType")
+    price_changes = update.get("price_changes") or update.get("priceChanges")
+    preview = None
+    if isinstance(price_changes, list) and price_changes:
+        preview = price_changes[0]
+    print(
+        "[PaperTrader] WS payload missing price for {}: event_type={} keys={} price_changes_preview={}".format(
+            token_id,
+            event_type,
+            list(update.keys()),
+            preview,
+        )
+    )
+
+
+def _normalize_ws_update(update: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(update, dict):
+        return update
+    if isinstance(update, list):
+        for item in update:
+            if isinstance(item, dict):
+                return item
     return None

@@ -63,18 +63,25 @@ class MarketMaker:
 
     def on_market_update(self, market_data: Dict[str, Any]) -> List[QuoteOrder]:
         """Generate orders when market data updates."""
-        if not self.should_update_orders(market_data):
+        token_id = market_data.get("token_id")
+        print(f"[MarketMaker] Processing update for {token_id}")
+        should_update = self.should_update_orders(market_data)
+        print(f"[MarketMaker] Should update: {should_update}")
+        if not should_update:
             return []
         orders = self.generate_orders(market_data)
         if orders:
-            token_id = market_data.get("token_id")
             if token_id:
                 self.active_orders[token_id] = {o.side: o for o in orders}
+            print(f"[MarketMaker] Generated {len(orders)} orders for {token_id}")
+        else:
+            print(f"[MarketMaker] No orders generated for {token_id}")
         return orders
 
     def should_update_orders(self, market_data: Dict[str, Any]) -> bool:
         token_id = market_data.get("token_id")
         if not token_id:
+            print("[MarketMaker] Missing token_id in market data")
             return False
 
         buy_price, sell_price, buy_size, sell_size = self._preview_quotes(market_data)
@@ -82,26 +89,34 @@ class MarketMaker:
 
         if buy_price is None or buy_size <= 0:
             if "BUY" in existing:
+                print(f"[MarketMaker] Clearing BUY for {token_id}")
                 return True
         else:
             prev_buy = existing.get("BUY")
             if not prev_buy:
+                print(f"[MarketMaker] No previous BUY for {token_id}")
                 return True
             if abs(prev_buy.price - buy_price) > self.config.price_update_threshold:
+                print(f"[MarketMaker] BUY price moved for {token_id}")
                 return True
             if prev_buy.size and abs(prev_buy.size - buy_size) > prev_buy.size * self.config.size_update_threshold_pct:
+                print(f"[MarketMaker] BUY size moved for {token_id}")
                 return True
 
         if sell_price is None or sell_size <= 0:
             if "SELL" in existing:
+                print(f"[MarketMaker] Clearing SELL for {token_id}")
                 return True
         else:
             prev_sell = existing.get("SELL")
             if not prev_sell:
+                print(f"[MarketMaker] No previous SELL for {token_id}")
                 return True
             if abs(prev_sell.price - sell_price) > self.config.price_update_threshold:
+                print(f"[MarketMaker] SELL price moved for {token_id}")
                 return True
             if prev_sell.size and abs(prev_sell.size - sell_size) > prev_sell.size * self.config.size_update_threshold_pct:
+                print(f"[MarketMaker] SELL size moved for {token_id}")
                 return True
 
         return False
@@ -110,6 +125,7 @@ class MarketMaker:
         market_id = market_data.get("market_id")
         token_id = market_data.get("token_id")
         if not market_id or not token_id:
+            print("[MarketMaker] Missing market_id or token_id")
             return []
 
         buy_price, sell_price, buy_size, sell_size = self._preview_quotes(market_data)
@@ -145,10 +161,12 @@ class MarketMaker:
     ) -> Tuple[Optional[float], Optional[float], float, float]:
         mid_price = self._get_mid_price(market_data)
         if mid_price is None:
+            print("[MarketMaker] Missing mid_price")
             return None, None, 0.0, 0.0
 
         order_notional = self._get_target_notional()
         if order_notional < self.config.min_order_notional:
+            print(f"[MarketMaker] Order notional too small: {order_notional:.2f}")
             return None, None, 0.0, 0.0
 
         liquidity = float(market_data.get("liquidity") or 0)
@@ -178,6 +196,16 @@ class MarketMaker:
         buy_size = buy_notional / buy_price if buy_price and buy_notional > 0 else 0.0
         sell_size = sell_notional / sell_price if sell_price and sell_notional > 0 else 0.0
 
+        print(
+            "[MarketMaker] mid={:.4f} spread={:.4f} buy={} sell={} sizes={:.4f}/{:.4f}".format(
+                mid_price,
+                spread,
+                f"{buy_price:.4f}" if buy_price else "None",
+                f"{sell_price:.4f}" if sell_price else "None",
+                buy_size,
+                sell_size,
+            )
+        )
         return buy_price, sell_price, buy_size, sell_size
 
     def _get_mid_price(self, market_data: Dict[str, Any]) -> Optional[float]:

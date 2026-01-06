@@ -114,6 +114,7 @@ class MarketTracker:
         """Start background WebSocket feed for real-time market updates."""
         if self._ws_thread and self._ws_thread.is_alive():
             return
+        print(f"[MarketTracker] Starting WebSocket for {len(token_ids)} tokens")
 
         def _run_loop():
             self._ws_loop = asyncio.new_event_loop()
@@ -126,6 +127,8 @@ class MarketTracker:
             )
             try:
                 self._ws_loop.run_until_complete(self._ws_task)
+            except Exception as exc:
+                print(f"[MarketTracker] WebSocket loop error: {exc}")
             finally:
                 self._ws_loop.close()
 
@@ -166,9 +169,17 @@ class MarketTracker:
         token_id = _extract_ws_asset_id(data)
         if not token_id:
             return
+        print(f"[MarketTracker] Received update for token {token_id}")
+        cache_ids = _expand_ws_asset_ids(token_id)
         with self._ws_lock:
-            self._ws_cache[token_id] = data
-            self._ws_last_update[token_id] = time.time()
+            for cache_id in cache_ids:
+                if cache_id not in self._ws_cache and isinstance(data, dict):
+                    print(
+                        f"[MarketTracker] First update keys for {cache_id}: "
+                        f"{list(data.keys())}"
+                    )
+                self._ws_cache[cache_id] = data
+                self._ws_last_update[cache_id] = time.time()
 
     def clear_cache(self):
         self._cache.clear()
@@ -202,3 +213,15 @@ def _extract_ws_asset_id(data: Any) -> Optional[str]:
             asset_id = first.get('asset_id') or first.get('assetId') or first.get('market')
             return str(asset_id) if asset_id is not None else None
     return None
+
+
+def _expand_ws_asset_ids(token_id: str) -> List[str]:
+    ids = [token_id]
+    try:
+        if token_id.startswith("0x"):
+            ids.append(str(int(token_id, 16)))
+        elif token_id.isdigit():
+            ids.append(hex(int(token_id)))
+    except ValueError:
+        pass
+    return list(dict.fromkeys(ids))

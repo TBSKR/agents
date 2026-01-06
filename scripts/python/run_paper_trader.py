@@ -14,6 +14,7 @@ Usage:
     python scripts/python/run_paper_trader.py update    - Update position prices
     python scripts/python/run_paper_trader.py backup    - Backup data to JSON
     python scripts/python/run_paper_trader.py --strategy market_maker --markets "id1,id2" --duration 15m
+    python scripts/python/run_paper_trader.py --strategy market_maker --market-ids "123,456" --duration 15m
     
 Strategies:
     --strategy ai        - AI-driven prediction trades (default)
@@ -25,6 +26,8 @@ Strategies:
 
 import sys
 import argparse
+import json
+from typing import List, Optional
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -33,6 +36,7 @@ from agents.application.paper_trader import PaperTrader
 from agents.application.performance_tracker import PerformanceTracker
 from agents.application.arbitrage_engine import print_opportunities
 from agents.application.gabagool_trader import print_positions as print_gabagool_positions
+from agents.polymarket.gamma import GammaMarketClient
 
 
 def cmd_trade(args):
@@ -289,9 +293,11 @@ def cmd_watch(args):
 
 def cmd_market_maker(args):
     """Run market making loop via WebSocket updates."""
-    token_ids = _parse_market_ids(args.markets)
+    token_ids = _parse_token_ids(args.markets)
+    token_ids += _resolve_token_ids_from_market_ids(args.market_ids)
+    token_ids = _dedupe_list(token_ids)
     if not token_ids:
-        print("No token ids provided. Use --markets \"id1,id2\"")
+        print("No token ids provided. Use --markets \"id1,id2\" or --market-ids \"123,456\"")
         return 1
 
     duration_seconds = _parse_duration(args.duration)
@@ -346,6 +352,10 @@ def main():
     parser.add_argument(
         '--markets',
         help='Comma-separated token ids for market making (e.g. "id1,id2")'
+    )
+    parser.add_argument(
+        '--market-ids',
+        help='Comma-separated market ids to resolve into clobTokenIds'
     )
     parser.add_argument(
         '--duration',
@@ -433,10 +443,82 @@ def _parse_duration(value: str) -> float:
     return float(value)
 
 
-def _parse_market_ids(markets: str) -> List[str]:
+def _parse_market_ids(markets: Optional[str]) -> List[str]:
     if not markets:
         return []
     return [m.strip() for m in markets.split(',') if m.strip()]
+
+
+def _parse_token_ids(markets: Optional[str]) -> List[str]:
+    if not markets:
+        return []
+    normalized = []
+    for raw in markets.split(','):
+        token_id = _normalize_token_id(raw)
+        if token_id:
+            normalized.append(token_id)
+    return normalized
+
+
+def _resolve_token_ids_from_market_ids(market_ids: Optional[str]) -> List[str]:
+    if not market_ids:
+        return []
+
+    ids = _parse_market_ids(market_ids)
+    gamma = GammaMarketClient()
+    token_ids: List[str] = []
+
+    for market_id in ids:
+        try:
+            market = gamma.get_market(market_id)
+        except Exception as exc:
+            print(f"Failed to fetch market {market_id}: {exc}")
+            continue
+        if not market:
+            continue
+
+        clob_ids = market.get("clobTokenIds") or market.get("clob_token_ids")
+        if isinstance(clob_ids, str):
+            try:
+                clob_ids = json.loads(clob_ids)
+            except json.JSONDecodeError:
+                clob_ids = []
+        if not isinstance(clob_ids, list):
+            clob_ids = []
+
+        for token_id in clob_ids:
+            normalized = _normalize_token_id(token_id)
+            if normalized:
+                token_ids.append(normalized)
+
+    if token_ids:
+        print(f"Resolved {len(token_ids)} token ids from {len(ids)} markets")
+    return token_ids
+
+
+def _normalize_token_id(token_id: Optional[object]) -> Optional[str]:
+    if token_id is None:
+        return None
+    if isinstance(token_id, int):
+        return hex(token_id)
+    token_str = str(token_id).strip()
+    if not token_str:
+        return None
+    if token_str.startswith("0x"):
+        return token_str
+    if token_str.isdigit():
+        return token_str
+    return token_str
+
+
+def _dedupe_list(items: List[str]) -> List[str]:
+    seen = set()
+    deduped = []
+    for item in items:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped
 
 
 if __name__ == "__main__":
