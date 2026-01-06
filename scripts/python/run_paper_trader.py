@@ -96,8 +96,10 @@ def filter_profitable_markets(
     selected_ids: List[str] = []
     selected_details: List[Dict[str, Any]] = []
     offset = 0
+    max_markets_to_scan = 500
+    markets_scanned = 0
 
-    while len(selected_ids) < limit:
+    while len(selected_ids) < limit and markets_scanned < max_markets_to_scan:
         params = {
             "active": True,
             "closed": False,
@@ -114,6 +116,8 @@ def filter_profitable_markets(
 
         if not markets:
             break
+
+        markets_scanned += len(markets)
 
         for market in markets:
             if market.get("active") is False or market.get("closed") is True or market.get("archived") is True:
@@ -156,7 +160,12 @@ def filter_profitable_markets(
             if len(selected_ids) >= limit:
                 break
 
+        print(f"Scanned {markets_scanned} markets, found {len(selected_ids)} matching...")
+
         if len(markets) < page_size:
+            break
+        if markets_scanned >= max_markets_to_scan:
+            print(f"Reached scan limit ({max_markets_to_scan} markets)")
             break
         offset += page_size
 
