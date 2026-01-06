@@ -52,6 +52,7 @@ class Position:
 class PaperPortfolio:
     INITIAL_BALANCE = 1000.0
     LEGACY_SLIPPAGE_RATE = 0.001  # 0.1% slippage (legacy fallback)
+    MAKER_FEE_BPS = 20  # 0.2% maker fee
 
     def __init__(
         self,
@@ -154,6 +155,14 @@ class PaperPortfolio:
             else:
                 return None, None
 
+        gross_trade_amount = trade_amount
+        fee_rate = self.MAKER_FEE_BPS / 10000
+        fee_amount = 0.0
+        effective_trade_amount = trade_amount
+        if side == "BUY":
+            fee_amount = gross_trade_amount * fee_rate
+            effective_trade_amount = max(gross_trade_amount - fee_amount, 0.0)
+
         valid, error = self.validate_trade(side, trade_amount if side == "BUY" else 0)
         if not valid:
             print(f"Trade validation failed: {error}")
@@ -166,7 +175,7 @@ class PaperPortfolio:
             execution_result = self._execute_with_fill_simulator(
                 side=side,
                 price=price,
-                trade_amount=trade_amount,
+                trade_amount=effective_trade_amount,
                 market_conditions=market_conditions,
                 liquidity=liquidity,
                 volume_24h=volume_24h
@@ -174,22 +183,42 @@ class PaperPortfolio:
             final_price = execution_result.average_price
             quantity = execution_result.total_quantity
             final_cost = execution_result.total_cost
-        else:
-            # Legacy fixed slippage
             if side == "BUY":
-                final_price = price * (1 + self.LEGACY_SLIPPAGE_RATE)
+                fee_amount = final_cost * fee_rate
+                total_debit = final_cost + fee_amount
+                if total_debit > self.cash_balance:
+                    return None, execution_result
             else:
-                final_price = price * (1 - self.LEGACY_SLIPPAGE_RATE)
-            quantity = trade_amount / final_price
+                fee_amount = final_cost * fee_rate
+        else:
+            # Basic slippage model (0.1% - 0.5% based on order size)
+            order_size_ratio = 0.0
+            if liquidity > 0:
+                order_size_ratio = trade_amount / liquidity
+            slippage_bps = 10 + (order_size_ratio * 100)
+            slippage_bps = min(max(slippage_bps, 0), 50)
+            slippage_rate = slippage_bps / 10000
+
+            if side == "BUY":
+                final_price = price * (1 + slippage_rate)
+                quantity = effective_trade_amount / max(final_price, 1e-12)
+            else:
+                final_price = price * (1 - slippage_rate)
+                quantity = gross_trade_amount / max(final_price, 1e-12)
             final_cost = quantity * final_price
 
         if side == "BUY":
-            self.cash_balance -= final_cost
+            if self._use_realistic_fills and self.fill_simulator is not None:
+                self.cash_balance -= final_cost + fee_amount
+                entry_value = final_cost + fee_amount
+            else:
+                self.cash_balance -= gross_trade_amount
+                entry_value = final_cost
 
             if token_id in self.positions:
                 existing = self.positions[token_id]
                 total_quantity = existing.quantity + quantity
-                total_value = existing.entry_value + final_cost
+                total_value = existing.entry_value + entry_value
                 avg_price = total_value / total_quantity
                 existing.quantity = total_quantity
                 existing.entry_value = total_value
@@ -204,11 +233,11 @@ class PaperPortfolio:
                     side=side,
                     entry_price=final_price,
                     quantity=quantity,
-                    entry_value=final_cost,
+                    entry_value=entry_value,
                     entry_time=datetime.now().isoformat(),
                     trade_id=trade_id,
                     current_price=final_price,
-                    current_value=final_cost
+                    current_value=entry_value
                 )
                 self.positions[token_id] = position
 
@@ -219,8 +248,17 @@ class PaperPortfolio:
 
             position = self.positions[token_id]
 
-            sell_quantity = position.quantity * size_pct
-            sell_value = sell_quantity * final_price
+            sell_quantity = min(quantity, position.quantity)
+            if self._use_realistic_fills and self.fill_simulator is not None:
+                sell_value = final_cost
+                if quantity > 0 and sell_quantity < quantity:
+                    sell_value *= sell_quantity / quantity
+                    fee_amount *= sell_quantity / quantity
+                sell_value -= fee_amount
+            else:
+                sell_value = sell_quantity * final_price
+                fee_amount = sell_value * fee_rate
+                sell_value -= fee_amount
 
             entry_cost_for_sold = (sell_quantity / position.quantity) * position.entry_value
             realized = sell_value - entry_cost_for_sold

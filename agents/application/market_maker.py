@@ -18,10 +18,10 @@ class MarketMakerConfig:
     size_update_threshold_pct: float = 0.1
     min_quote_price: float = 0.01
     max_quote_price: float = 0.99
-    order_size_pct: float = 0.05
+    order_size_pct: float = 0.02
     max_inventory_pct: float = 0.30
     inventory_rebalance_pct: float = 0.80
-    min_order_notional: float = 10.0
+    min_order_notional: float = 5.0
     max_order_notional: Optional[float] = None
     allow_short: bool = False
 

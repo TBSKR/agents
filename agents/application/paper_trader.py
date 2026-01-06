@@ -929,6 +929,39 @@ class PaperTrader:
         question = market_data.get("question", "")
         outcome = market_data.get("outcome", "YES")
 
+        mid_price = market_data.get("mid_price") or order.price
+        if mid_price is None:
+            return False
+
+        spread_abs = market_data.get("spread")
+        spread_pct = None
+        if spread_abs is not None and mid_price:
+            try:
+                spread_abs = float(spread_abs)
+            except (TypeError, ValueError):
+                spread_abs = None
+        if spread_abs is None:
+            liquidity = float(market_data.get("liquidity") or 0)
+            volume_24h = float(market_data.get("volume_24h") or market_data.get("volume") or 0)
+            spread_model = PolymarketSpreadModel()
+            spread_pct = spread_model.calculate_spread(
+                liquidity=liquidity,
+                volume_24h=volume_24h,
+                order_size=order.notional,
+                price=mid_price,
+            )
+            spread_abs = mid_price * spread_pct
+        elif mid_price:
+            spread_pct = spread_abs / mid_price if mid_price > 0 else 0.0
+
+        half_spread = (spread_abs or 0.0) / 2
+        bid_price = max(0.001, mid_price - half_spread)
+        ask_price = min(0.999, mid_price + half_spread)
+        if self.use_realistic_fills:
+            execution_price = ask_price if order.side == "BUY" else bid_price
+        else:
+            execution_price = bid_price if order.side == "BUY" else ask_price
+
         if order.side == "BUY":
             if self.portfolio.cash_balance <= 0:
                 return False
@@ -952,11 +985,11 @@ class PaperTrader:
             token_id=token_id,
             outcome=outcome,
             side=order.side,
-            entry_price=order.price,
+            entry_price=execution_price,
             quantity=0,
             entry_value=0,
             ai_prediction=0,
-            market_price_at_entry=order.price,
+            market_price_at_entry=mid_price,
             balance_after=self.portfolio.cash_balance,
         )
 
@@ -967,20 +1000,13 @@ class PaperTrader:
 
                 liquidity = float(market_data.get("liquidity") or 0)
                 volume_24h = float(market_data.get("volume_24h") or market_data.get("volume") or 0)
-                order_size = order.notional
-                spread_model = PolymarketSpreadModel()
-                spread_pct = spread_model.calculate_spread(
-                    liquidity=liquidity,
-                    volume_24h=volume_24h,
-                    order_size=order_size,
-                    price=order.price,
-                )
-                half_spread = spread_pct / 2
+                if spread_pct is None:
+                    spread_pct = spread_abs / mid_price if mid_price else 0.0
                 market_conditions = MarketConditions(
-                    mid_price=order.price,
-                    bid_price=order.price * (1 - half_spread),
-                    ask_price=order.price * (1 + half_spread),
-                    spread=spread_pct,
+                    mid_price=mid_price,
+                    bid_price=bid_price,
+                    ask_price=ask_price,
+                    spread=spread_pct or 0.0,
                     liquidity=liquidity,
                     volume_24h=volume_24h,
                 )
@@ -993,7 +1019,7 @@ class PaperTrader:
             question=question,
             outcome=outcome,
             side=order.side,
-            price=order.price,
+            price=execution_price,
             size_pct=size_pct,
             trade_id=trade_id,
             market_conditions=market_conditions,
