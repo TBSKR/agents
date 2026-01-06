@@ -883,6 +883,10 @@ class PaperTrader:
                         print(f"[PaperTrader] No market data built for {token_id}")
                         continue
 
+                    mid_price = market_data.get("mid_price")
+                    if mid_price:
+                        self.portfolio.update_position_prices({token_id: mid_price})
+
                     orders = market_maker.on_market_update(market_data)
                     if not orders:
                         print(f"[PaperTrader] No orders for {token_id}")
@@ -1030,34 +1034,69 @@ def _build_market_data_from_ws(token_id: str, update: Any) -> Optional[Dict[str,
     if not update:
         return None
 
-    normalized = _normalize_ws_update(update)
+    normalized = _normalize_ws_update(update, token_id=token_id)
     if not normalized:
         _debug_ws_payload(token_id, update)
         return None
 
     market_id = normalized.get("market") or normalized.get("asset_id") or normalized.get("assetId")
 
-    mid_price = _extract_ws_mid_price(update)
+    mid_price = _extract_ws_mid_price(update, token_id=token_id)
     if mid_price is None:
         _debug_ws_payload(token_id, update)
         return None
 
+    liquidity = _extract_ws_liquidity(normalized)
+    spread = _extract_ws_spread(normalized, token_id=token_id)
+
+    parsed_timestamp = _parse_ws_timestamp(normalized.get("timestamp"))
     return {
         "market_id": str(market_id) if market_id is not None else str(token_id),
         "token_id": str(token_id),
         "mid_price": mid_price,
         "price": mid_price,
-        "timestamp": normalized.get("timestamp"),
-        "liquidity": normalized.get("liquidity"),
+        "spread": spread,
+        "timestamp": parsed_timestamp,
+        "liquidity": liquidity,
         "volume": normalized.get("volume"),
         "volume_24h": normalized.get("volume_24h"),
     }
 
 
-def _extract_ws_mid_price(update: Any) -> Optional[float]:
-    normalized = _normalize_ws_update(update)
+def _extract_ws_mid_price(update: Any, token_id: Optional[str] = None) -> Optional[float]:
+    normalized = _normalize_ws_update(update, token_id=token_id)
     if not normalized:
         return None
+
+    event_type = normalized.get("event_type") or normalized.get("eventType")
+
+    if event_type == "price_change":
+        best_bid, best_ask = _best_bid_ask_from_price_change(normalized, token_id=token_id)
+        if best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > 0:
+            return (best_bid + best_ask) / 2
+    elif event_type == "book":
+        bids = normalized.get("bids") or []
+        asks = normalized.get("asks") or []
+        best_bid = float(bids[0]["price"]) if bids else None
+        best_ask = float(asks[0]["price"]) if asks else None
+        if best_bid is not None and best_ask is not None:
+            return (best_bid + best_ask) / 2
+        if best_bid is not None:
+            return best_bid
+        if best_ask is not None:
+            return best_ask
+        last_trade = normalized.get("last_trade_price")
+        if last_trade:
+            return float(last_trade)
+    elif event_type == "last_trade_price":
+        price = normalized.get("price")
+        if price:
+            return float(price)
+    elif event_type == "best_bid_ask":
+        best_bid = normalized.get("best_bid")
+        best_ask = normalized.get("best_ask")
+        if best_bid and best_ask:
+            return (float(best_bid) + float(best_ask)) / 2
 
     if "price" in normalized:
         try:
@@ -1065,35 +1104,13 @@ def _extract_ws_mid_price(update: Any) -> Optional[float]:
         except (TypeError, ValueError):
             return None
 
-    price_changes = None
-    price_changes = normalized.get("price_changes") or normalized.get("priceChanges")
-    if not price_changes:
-        return None
-
-    prices = []
-    for change in price_changes:
-        if isinstance(change, dict):
-            if "price" in change:
-                try:
-                    prices.append(float(change["price"]))
-                except (TypeError, ValueError):
-                    continue
-        elif isinstance(change, (list, tuple)) and change:
-            try:
-                prices.append(float(change[0]))
-            except (TypeError, ValueError):
-                continue
-
-    if not prices:
-        return None
-    if len(prices) == 1:
-        return prices[0]
-    return (min(prices) + max(prices)) / 2
+    return None
 
 
 def _extract_ws_timestamp(update: Any) -> Optional[Any]:
-    if isinstance(update, dict):
-        return update.get("timestamp")
+    normalized = _normalize_ws_update(update)
+    if isinstance(normalized, dict):
+        return normalized.get("timestamp")
     return None
 
 
@@ -1126,11 +1143,93 @@ def _debug_ws_payload(token_id: str, update: Any) -> None:
     )
 
 
-def _normalize_ws_update(update: Any) -> Optional[Dict[str, Any]]:
+def _normalize_ws_update(update: Any, token_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if isinstance(update, dict):
         return update
     if isinstance(update, list):
+        if token_id is not None:
+            for item in update:
+                if isinstance(item, dict):
+                    asset_id = item.get("asset_id") or item.get("assetId")
+                    if asset_id and str(asset_id) == str(token_id):
+                        return item
         for item in update:
             if isinstance(item, dict):
                 return item
+    return None
+
+
+def _parse_ws_timestamp(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+        else:
+            timestamp = float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+    if timestamp > 1e12:
+        timestamp /= 1000.0
+    return datetime.utcfromtimestamp(timestamp)
+
+
+def _best_bid_ask_from_price_change(
+    normalized: Dict[str, Any],
+    token_id: Optional[str] = None,
+) -> Tuple[Optional[float], Optional[float]]:
+    price_changes = normalized.get("price_changes") or normalized.get("priceChanges") or []
+    if not isinstance(price_changes, list) or not price_changes:
+        return None, None
+
+    match = None
+    if token_id is not None:
+        for change in price_changes:
+            if isinstance(change, dict):
+                asset_id = change.get("asset_id") or change.get("assetId")
+                if asset_id and str(asset_id) == str(token_id):
+                    match = change
+                    break
+
+    if match is None:
+        match = price_changes[0] if isinstance(price_changes[0], dict) else None
+
+    if not match:
+        return None, None
+
+    best_bid = match.get("best_bid")
+    best_ask = match.get("best_ask")
+    try:
+        return float(best_bid) if best_bid is not None else None, float(best_ask) if best_ask is not None else None
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _extract_ws_liquidity(normalized: Dict[str, Any]) -> float:
+    if (normalized.get("event_type") or normalized.get("eventType")) == "book":
+        bids = normalized.get("bids") or []
+        asks = normalized.get("asks") or []
+        bid_liq = sum(float(b["size"]) for b in bids[:5]) if bids else 0.0
+        ask_liq = sum(float(a["size"]) for a in asks[:5]) if asks else 0.0
+        return bid_liq + ask_liq
+    return 0.0
+
+
+def _extract_ws_spread(normalized: Dict[str, Any], token_id: Optional[str] = None) -> Optional[float]:
+    event_type = normalized.get("event_type") or normalized.get("eventType")
+    if event_type == "best_bid_ask":
+        spread = normalized.get("spread")
+        return float(spread) if spread is not None else None
+    if event_type == "price_change":
+        best_bid, best_ask = _best_bid_ask_from_price_change(normalized, token_id=token_id)
+        if best_bid is not None and best_ask is not None:
+            return best_ask - best_bid
+    if event_type == "book":
+        bids = normalized.get("bids") or []
+        asks = normalized.get("asks") or []
+        if bids and asks:
+            return float(asks[0]["price"]) - float(bids[0]["price"])
     return None

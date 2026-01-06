@@ -16,8 +16,8 @@ from agents.application.spread_model import SpreadModel
 class MarketMakerConfig:
     price_update_threshold: float = 0.005
     size_update_threshold_pct: float = 0.1
-    min_quote_price: float = 0.10
-    max_quote_price: float = 0.90
+    min_quote_price: float = 0.01
+    max_quote_price: float = 0.99
     order_size_pct: float = 0.05
     max_inventory_pct: float = 0.30
     inventory_rebalance_pct: float = 0.80
