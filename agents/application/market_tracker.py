@@ -117,20 +117,60 @@ class MarketTracker:
         print(f"[MarketTracker] Starting WebSocket for {len(token_ids)} tokens")
 
         def _run_loop():
-            self._ws_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._ws_loop)
-            self._ws_client = PolymarketWebSocketClient(
-                on_market_update=self._handle_market_update
-            )
-            self._ws_task = self._ws_loop.create_task(
-                self._ws_client.connect_market_feed(token_ids, chunk_size=chunk_size)
-            )
+            def _thread_exception_handler(args):
+                import traceback
+
+                print("[MarketTracker] Thread exception caught:")
+                print(f"  Type: {args.exc_type}")
+                print(f"  Value: {args.exc_value}")
+                print("  Traceback:")
+                traceback.print_tb(args.exc_traceback)
+
+            previous_hook = threading.excepthook
+            threading.excepthook = _thread_exception_handler
+
+            def _task_done(task: asyncio.Task):
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    return
+                except Exception as exc:
+                    import traceback
+
+                    print(f"[MarketTracker] WebSocket task error: {exc}")
+                    traceback.print_exc()
             try:
-                self._ws_loop.run_until_complete(self._ws_task)
+                self._ws_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self._ws_loop)
+                self._ws_client = PolymarketWebSocketClient(
+                    on_market_update=self._handle_market_update
+                )
+                self._ws_task = self._ws_loop.create_task(
+                    self._ws_client.connect_market_feed(token_ids, chunk_size=chunk_size)
+                )
+                self._ws_task.add_done_callback(_task_done)
+                try:
+                    self._ws_loop.run_until_complete(self._ws_task)
+                except asyncio.CancelledError:
+                    pass
+                except BaseException as exc:
+                    import traceback
+
+                    print(f"[MarketTracker] WebSocket loop error: {exc}")
+                    traceback.print_exc()
             except Exception as exc:
-                print(f"[MarketTracker] WebSocket loop error: {exc}")
+                import traceback
+
+                print(f"[MarketTracker] WebSocket thread exception: {exc}")
+                print("[MarketTracker] Traceback:")
+                traceback.print_exc()
             finally:
-                self._ws_loop.close()
+                if self._ws_loop:
+                    try:
+                        self._ws_loop.close()
+                    except Exception as exc:
+                        print(f"[MarketTracker] WebSocket loop close error: {exc}")
+                threading.excepthook = previous_hook
 
         self._ws_thread = threading.Thread(target=_run_loop, daemon=True)
         self._ws_thread.start()
@@ -166,6 +206,44 @@ class MarketTracker:
         return data
 
     def _handle_market_update(self, data: Dict[str, Any]):
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    self._handle_market_update(item)
+            return
+        if not isinstance(data, dict):
+            return
+
+        event_type = data.get("event_type") or data.get("eventType")
+        if event_type == "price_change":
+            price_changes = data.get("price_changes") or data.get("priceChanges") or []
+            for price_change in price_changes:
+                if not isinstance(price_change, dict):
+                    continue
+                asset_id = price_change.get("asset_id") or price_change.get("assetId")
+                if not asset_id:
+                    continue
+                asset_id = str(asset_id)
+                cached_data = {
+                    "event_type": "price_change",
+                    "asset_id": asset_id,
+                    "market": data.get("market"),
+                    "price_changes": [price_change],
+                    "timestamp": data.get("timestamp"),
+                }
+                print(f"[MarketTracker] Cached price_change for asset {asset_id}")
+                cache_ids = _expand_ws_asset_ids(asset_id)
+                with self._ws_lock:
+                    for cache_id in cache_ids:
+                        if cache_id not in self._ws_cache:
+                            print(
+                                f"[MarketTracker] First update keys for {cache_id}: "
+                                f"{list(cached_data.keys())}"
+                            )
+                        self._ws_cache[cache_id] = cached_data
+                        self._ws_last_update[cache_id] = time.time()
+            return
+
         token_id = _extract_ws_asset_id(data)
         if not token_id:
             return
@@ -173,7 +251,7 @@ class MarketTracker:
         cache_ids = _expand_ws_asset_ids(token_id)
         with self._ws_lock:
             for cache_id in cache_ids:
-                if cache_id not in self._ws_cache and isinstance(data, dict):
+                if cache_id not in self._ws_cache:
                     print(
                         f"[MarketTracker] First update keys for {cache_id}: "
                         f"{list(data.keys())}"
@@ -205,13 +283,23 @@ class MarketTracker:
 
 def _extract_ws_asset_id(data: Any) -> Optional[str]:
     if isinstance(data, dict):
+        event_type = data.get("event_type") or data.get("eventType")
+        if event_type == "price_change":
+            price_changes = data.get("price_changes") or data.get("priceChanges") or []
+            if price_changes:
+                first = price_changes[0]
+                if isinstance(first, dict):
+                    asset_id = first.get("asset_id") or first.get("assetId")
+                    if asset_id is not None:
+                        return str(asset_id)
         asset_id = data.get('asset_id') or data.get('assetId') or data.get('market')
         return str(asset_id) if asset_id is not None else None
     if isinstance(data, list) and data:
-        first = data[0]
-        if isinstance(first, dict):
-            asset_id = first.get('asset_id') or first.get('assetId') or first.get('market')
-            return str(asset_id) if asset_id is not None else None
+        for item in data:
+            if isinstance(item, dict):
+                asset_id = _extract_ws_asset_id(item)
+                if asset_id:
+                    return asset_id
     return None
 
 
