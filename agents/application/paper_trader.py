@@ -2,6 +2,8 @@ import re
 import ast
 import json
 import shutil
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 
@@ -11,6 +13,8 @@ from agents.application.market_tracker import MarketTracker
 from agents.application.arbitrage_engine import ArbitrageEngine, ArbitrageOpportunity
 from agents.application.gabagool_trader import GabagoolTrader
 from agents.application.market_watcher import MarketWatcher
+from agents.application.market_maker import MarketMaker, MarketMakerConfig, QuoteOrder
+from agents.application.spread_model import PolymarketSpreadModel
 from agents.polymarket.gamma import GammaMarketClient
 
 
@@ -832,8 +836,244 @@ class PaperTrader:
         self.watcher.add_callback(on_opportunity)
         self.watcher.watch(duration=duration)
 
+    # ==================== MARKET MAKING ====================
+
+    def run_market_making(
+        self,
+        token_ids: List[str],
+        duration_seconds: float = 900,
+        poll_interval: float = 1.0,
+        config: MarketMakerConfig = None,
+    ) -> Dict[str, Any]:
+        """Run market making loop using WebSocket updates."""
+        mm_config = config or MarketMakerConfig()
+        market_maker = MarketMaker(
+            portfolio=self.portfolio,
+            spread_model=PolymarketSpreadModel(),
+            config=mm_config,
+        )
+
+        self.market_tracker.start_websocket_feed(token_ids)
+
+        results = {
+            'orders_generated': 0,
+            'orders_executed': 0,
+            'start_time': datetime.utcnow().isoformat(),
+        }
+        last_processed_ts: Dict[str, Any] = {}
+
+        try:
+            start = time.monotonic()
+            while time.monotonic() - start < duration_seconds:
+                for token_id in token_ids:
+                    update = self.market_tracker.get_websocket_update(token_id, max_age_seconds=5)
+                    if not update:
+                        continue
+
+                    update_ts = _extract_ws_timestamp(update)
+                    if update_ts is not None and last_processed_ts.get(token_id) == update_ts:
+                        continue
+                    if update_ts is not None:
+                        last_processed_ts[token_id] = update_ts
+
+                    market_data = _build_market_data_from_ws(token_id, update)
+                    if not market_data:
+                        continue
+
+                    orders = market_maker.on_market_update(market_data)
+                    if not orders:
+                        continue
+
+                    results['orders_generated'] += len(orders)
+                    for order in orders:
+                        if self._execute_market_maker_order(order, market_data):
+                            results['orders_executed'] += 1
+
+                time.sleep(poll_interval)
+        finally:
+            self.market_tracker.stop_websocket_feed()
+
+        summary = self.portfolio.get_portfolio_summary()
+        self.logger.log_portfolio_snapshot(
+            total_value=summary['total_value'],
+            cash_balance=summary['cash_balance'],
+            positions_value=summary['positions_value'],
+            num_open_positions=summary['num_open_positions'],
+            total_pnl=summary['total_pnl'],
+            total_return_pct=summary['total_return_pct'],
+        )
+        results['end_time'] = datetime.utcnow().isoformat()
+        results['portfolio_value'] = summary['total_value']
+        return results
+
+    def _execute_market_maker_order(
+        self,
+        order: QuoteOrder,
+        market_data: Dict[str, Any],
+    ) -> bool:
+        """Execute a market making order in paper mode."""
+        if order.side not in {"BUY", "SELL"}:
+            return False
+
+        market_id = order.market_id
+        token_id = order.token_id
+        question = market_data.get("question", "")
+        outcome = market_data.get("outcome", "YES")
+
+        if order.side == "BUY":
+            if self.portfolio.cash_balance <= 0:
+                return False
+            size_pct = order.notional / max(self.portfolio.cash_balance, 1e-6)
+        else:
+            position = self.portfolio.positions.get(token_id)
+            if not position:
+                return False
+            position_value = position.current_value or position.entry_value
+            if position_value <= 0:
+                return False
+            size_pct = order.notional / max(position_value, 1e-6)
+
+        size_pct = max(0.0, min(size_pct, 1.0))
+        if size_pct <= 0:
+            return False
+
+        trade_id = self.logger.log_trade(
+            market_id=market_id,
+            question=question,
+            token_id=token_id,
+            outcome=outcome,
+            side=order.side,
+            entry_price=order.price,
+            quantity=0,
+            entry_value=0,
+            ai_prediction=0,
+            market_price_at_entry=order.price,
+            balance_after=self.portfolio.cash_balance,
+        )
+
+        market_conditions = None
+        if self.use_realistic_fills:
+            try:
+                from agents.application.fill_simulator import MarketConditions
+
+                liquidity = float(market_data.get("liquidity") or 0)
+                volume_24h = float(market_data.get("volume_24h") or market_data.get("volume") or 0)
+                order_size = order.notional
+                spread_model = PolymarketSpreadModel()
+                spread_pct = spread_model.calculate_spread(
+                    liquidity=liquidity,
+                    volume_24h=volume_24h,
+                    order_size=order_size,
+                    price=order.price,
+                )
+                half_spread = spread_pct / 2
+                market_conditions = MarketConditions(
+                    mid_price=order.price,
+                    bid_price=order.price * (1 - half_spread),
+                    ask_price=order.price * (1 + half_spread),
+                    spread=spread_pct,
+                    liquidity=liquidity,
+                    volume_24h=volume_24h,
+                )
+            except Exception:
+                market_conditions = None
+
+        position, execution_result = self.portfolio.execute_simulated_trade(
+            market_id=market_id,
+            token_id=token_id,
+            question=question,
+            outcome=outcome,
+            side=order.side,
+            price=order.price,
+            size_pct=size_pct,
+            trade_id=trade_id,
+            market_conditions=market_conditions,
+            liquidity=float(market_data.get("liquidity") or 0),
+            volume_24h=float(market_data.get("volume_24h") or market_data.get("volume") or 0),
+        )
+
+        if not position:
+            return False
+
+        from agents.application.trade_logger import sqlite3
+        conn = sqlite3.connect(self.logger.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE trades
+            SET quantity = ?, entry_value = ?, entry_price = ?, balance_after = ?
+            WHERE id = ?
+        ''', (
+            position.quantity,
+            position.entry_value,
+            position.entry_price,
+            self.portfolio.cash_balance,
+            trade_id
+        ))
+        conn.commit()
+        conn.close()
+
+        return True
+
 
 if __name__ == "__main__":
     trader = PaperTrader()
     result = trader.execute_paper_trade_cycle()
     print(f"\nResult: {result}")
+
+
+def _build_market_data_from_ws(token_id: str, update: Any) -> Optional[Dict[str, Any]]:
+    if not update:
+        return None
+
+    market_id = None
+    if isinstance(update, dict):
+        market_id = update.get("market") or update.get("asset_id") or update.get("assetId")
+
+    mid_price = _extract_ws_mid_price(update)
+    if mid_price is None:
+        return None
+
+    return {
+        "market_id": str(market_id) if market_id is not None else str(token_id),
+        "token_id": str(token_id),
+        "mid_price": mid_price,
+        "price": mid_price,
+        "timestamp": update.get("timestamp") if isinstance(update, dict) else None,
+        "liquidity": update.get("liquidity") if isinstance(update, dict) else None,
+        "volume": update.get("volume") if isinstance(update, dict) else None,
+        "volume_24h": update.get("volume_24h") if isinstance(update, dict) else None,
+    }
+
+
+def _extract_ws_mid_price(update: Any) -> Optional[float]:
+    if isinstance(update, dict) and "price" in update:
+        try:
+            return float(update["price"])
+        except (TypeError, ValueError):
+            return None
+
+    price_changes = None
+    if isinstance(update, dict):
+        price_changes = update.get("price_changes") or update.get("priceChanges")
+    if not price_changes:
+        return None
+
+    prices = []
+    for change in price_changes:
+        if isinstance(change, dict) and "price" in change:
+            try:
+                prices.append(float(change["price"]))
+            except (TypeError, ValueError):
+                continue
+
+    if not prices:
+        return None
+    if len(prices) == 1:
+        return prices[0]
+    return (min(prices) + max(prices)) / 2
+
+
+def _extract_ws_timestamp(update: Any) -> Optional[Any]:
+    if isinstance(update, dict):
+        return update.get("timestamp")
+    return None
