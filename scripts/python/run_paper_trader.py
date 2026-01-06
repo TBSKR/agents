@@ -13,12 +13,14 @@ Usage:
     python scripts/python/run_paper_trader.py report    - Generate performance report
     python scripts/python/run_paper_trader.py update    - Update position prices
     python scripts/python/run_paper_trader.py backup    - Backup data to JSON
+    python scripts/python/run_paper_trader.py --strategy market_maker --markets "id1,id2" --duration 15m
     
 Strategies:
     --strategy ai        - AI-driven prediction trades (default)
     --strategy arbitrage - Risk-free arbitrage trades (YES+NO < $1)
     --strategy gabagool  - Gabagool strategy (buy both sides cheap)
     --strategy mixed     - Arbitrage first, then AI trades
+    --strategy market_maker - Market making with two-sided quotes
 """
 
 import sys
@@ -285,6 +287,38 @@ def cmd_watch(args):
     return 0
 
 
+def cmd_market_maker(args):
+    """Run market making loop via WebSocket updates."""
+    token_ids = _parse_market_ids(args.markets)
+    if not token_ids:
+        print("No token ids provided. Use --markets \"id1,id2\"")
+        return 1
+
+    duration_seconds = _parse_duration(args.duration)
+    if duration_seconds <= 0:
+        print("Invalid duration. Use formats like 15m, 2h, 900s")
+        return 1
+
+    trader = PaperTrader(initial_balance=args.balance, use_realistic_fills=args.realistic)
+
+    print("\nStarting market making...")
+    print(f"  Tokens: {len(token_ids)}")
+    print(f"  Duration: {duration_seconds:.0f}s")
+    print(f"  Realistic fills: {args.realistic}")
+
+    results = trader.run_market_making(
+        token_ids=token_ids,
+        duration_seconds=duration_seconds,
+        poll_interval=args.poll_interval,
+    )
+
+    print("\nMarket making complete.")
+    print(f"  Orders generated: {results.get('orders_generated', 0)}")
+    print(f"  Orders executed:  {results.get('orders_executed', 0)}")
+    print(f"  Portfolio value:  ${results.get('portfolio_value', 0):,.2f}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Paper Trading CLI for Polymarket AI Agent",
@@ -303,6 +337,26 @@ def main():
         action='store_true',
         default=False,
         help='Use realistic fill simulation (variable slippage, partial fills)'
+    )
+    parser.add_argument(
+        '--strategy',
+        choices=['market_maker'],
+        help='Strategy to run without a subcommand (market_maker only)'
+    )
+    parser.add_argument(
+        '--markets',
+        help='Comma-separated token ids for market making (e.g. "id1,id2")'
+    )
+    parser.add_argument(
+        '--duration',
+        default='15m',
+        help='Run duration for market making (e.g. 15m, 2h, 900s)'
+    )
+    parser.add_argument(
+        '--poll-interval',
+        type=float,
+        default=1.0,
+        help='Polling interval in seconds for market making loop'
     )
 
     realistic_parent = argparse.ArgumentParser(add_help=False)
@@ -345,6 +399,8 @@ def main():
     args = parser.parse_args()
     
     if args.command is None:
+        if args.strategy == 'market_maker':
+            return cmd_market_maker(args)
         parser.print_help()
         return 1
     
@@ -362,6 +418,25 @@ def main():
     }
     
     return commands[args.command](args)
+
+
+def _parse_duration(value: str) -> float:
+    value = value.strip().lower()
+    if value.endswith('s'):
+        return float(value[:-1])
+    if value.endswith('m'):
+        return float(value[:-1]) * 60
+    if value.endswith('h'):
+        return float(value[:-1]) * 3600
+    if value.endswith('d'):
+        return float(value[:-1]) * 86400
+    return float(value)
+
+
+def _parse_market_ids(markets: str) -> List[str]:
+    if not markets:
+        return []
+    return [m.strip() for m in markets.split(',') if m.strip()]
 
 
 if __name__ == "__main__":
