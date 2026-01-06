@@ -27,7 +27,7 @@ Strategies:
 import sys
 import argparse
 import json
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -36,7 +36,133 @@ from agents.application.paper_trader import PaperTrader
 from agents.application.performance_tracker import PerformanceTracker
 from agents.application.arbitrage_engine import print_opportunities
 from agents.application.gabagool_trader import print_positions as print_gabagool_positions
+from agents.application.market_maker import MarketMakerConfig
 from agents.polymarket.gamma import GammaMarketClient
+
+
+def _coerce_float(value: Optional[object]) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_outcome_prices(raw: Optional[object]) -> List[float]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(raw, list):
+        return []
+    prices: List[float] = []
+    for price in raw:
+        try:
+            prices.append(float(price))
+        except (TypeError, ValueError):
+            continue
+    return prices
+
+
+def _extract_market_volume(market: Dict[str, Any]) -> Optional[float]:
+    for key in ("volume24hr", "volume24h", "volume_24h", "volume", "volumeUsd", "volumeUSD"):
+        volume = _coerce_float(market.get(key))
+        if volume is not None:
+            return volume
+    return None
+
+
+def _extract_market_id(market: Dict[str, Any]) -> Optional[str]:
+    for key in ("id", "market_id", "marketId"):
+        market_id = market.get(key)
+        if market_id is not None:
+            return str(market_id)
+    return None
+
+
+def filter_profitable_markets(
+    min_spread: float = 0.025,
+    max_spread: float = 0.10,
+    min_volume: float = 10000,
+    max_volume: float = 1000000,
+    limit: int = 5,
+    page_size: int = 100,
+    return_details: bool = False,
+) -> Union[List[str], Tuple[List[str], List[Dict[str, Any]]]]:
+    """Fetch active CLOB markets and filter by spread and volume."""
+    gamma = GammaMarketClient()
+    selected_ids: List[str] = []
+    selected_details: List[Dict[str, Any]] = []
+    offset = 0
+
+    while len(selected_ids) < limit:
+        params = {
+            "active": True,
+            "closed": False,
+            "archived": False,
+            "enableOrderBook": True,
+            "limit": page_size,
+            "offset": offset,
+        }
+        try:
+            markets = gamma.get_markets(querystring_params=params)
+        except Exception as exc:
+            print(f"Failed to fetch markets: {exc}")
+            break
+
+        if not markets:
+            break
+
+        for market in markets:
+            if market.get("active") is False or market.get("closed") is True or market.get("archived") is True:
+                continue
+
+            enable_order_book = market.get("enableOrderBook")
+            if enable_order_book is None:
+                enable_order_book = market.get("enable_order_book")
+            if enable_order_book is False:
+                continue
+
+            market_id = _extract_market_id(market)
+            if not market_id:
+                continue
+
+            volume = _extract_market_volume(market)
+            if volume is None or volume < min_volume or volume > max_volume:
+                continue
+
+            outcome_prices = _parse_outcome_prices(market.get("outcomePrices") or market.get("outcome_prices"))
+            if len(outcome_prices) < 2:
+                continue
+
+            yes_price = outcome_prices[0]
+            no_price = outcome_prices[1]
+            spread_abs = abs(1.0 - (yes_price + no_price))
+            spread_pct = spread_abs / 0.5
+            if spread_pct < min_spread or spread_pct > max_spread:
+                continue
+
+            selected_ids.append(market_id)
+            selected_details.append(
+                {
+                    "market_id": market_id,
+                    "spread": spread_abs,
+                    "spread_pct": spread_pct,
+                    "volume": volume,
+                }
+            )
+            if len(selected_ids) >= limit:
+                break
+
+        if len(markets) < page_size:
+            break
+        offset += page_size
+
+    if return_details:
+        return selected_ids, selected_details
+    return selected_ids
 
 
 def cmd_trade(args):
@@ -293,8 +419,37 @@ def cmd_watch(args):
 
 def cmd_market_maker(args):
     """Run market making loop via WebSocket updates."""
-    token_ids = _parse_token_ids(args.markets)
-    token_ids += _resolve_token_ids_from_market_ids(args.market_ids)
+    token_ids: List[str] = []
+    if args.auto_select_markets:
+        print("Auto-selecting markets with profitable spreads...")
+        market_ids, details = filter_profitable_markets(
+            min_spread=args.min_spread,
+            max_spread=args.max_spread,
+            min_volume=args.min_volume,
+            max_volume=args.max_volume,
+            limit=5,
+            return_details=True,
+        )
+        if not market_ids:
+            print("No markets met the selection criteria.")
+            return 1
+        print(f"Selected {len(market_ids)} markets:")
+        for detail in details:
+            spread_pct = detail.get("spread_pct")
+            volume = detail.get("volume")
+            spread_label = f"{spread_pct:.2%}" if spread_pct is not None else "n/a"
+            if volume is not None:
+                print(
+                    "  - {} (Spread: {}, Volume: ${:,.0f})".format(
+                        detail.get("market_id"), spread_label, volume
+                    )
+                )
+            else:
+                print(f"  - {detail.get('market_id')} (Spread: {spread_label})")
+        token_ids = _resolve_token_ids_from_market_ids(",".join(market_ids))
+    else:
+        token_ids = _parse_token_ids(args.markets)
+        token_ids += _resolve_token_ids_from_market_ids(args.market_ids)
     token_ids = _dedupe_list(token_ids)
     if not token_ids:
         print("No token ids provided. Use --markets \"id1,id2\" or --market-ids \"123,456\"")
@@ -312,10 +467,12 @@ def cmd_market_maker(args):
     print(f"  Duration: {duration_seconds:.0f}s")
     print(f"  Realistic fills: {args.realistic}")
 
+    mm_config = MarketMakerConfig(min_spread_pct=args.min_spread)
     results = trader.run_market_making(
         token_ids=token_ids,
         duration_seconds=duration_seconds,
         poll_interval=args.poll_interval,
+        config=mm_config,
     )
 
     print("\nMarket making complete.")
@@ -356,6 +513,36 @@ def main():
     parser.add_argument(
         '--market-ids',
         help='Comma-separated market ids to resolve into clobTokenIds'
+    )
+    parser.add_argument(
+        '--auto-select-markets',
+        action='store_true',
+        default=False,
+        help='Auto-select markets based on spread and volume filters'
+    )
+    parser.add_argument(
+        '--min-spread',
+        type=float,
+        default=0.025,
+        help='Minimum spread as decimal (default: 0.025 = 2.5%)'
+    )
+    parser.add_argument(
+        '--max-spread',
+        type=float,
+        default=0.10,
+        help='Maximum spread as decimal (default: 0.10 = 10%)'
+    )
+    parser.add_argument(
+        '--min-volume',
+        type=float,
+        default=10000,
+        help='Minimum volume filter in USD (default: 10000)'
+    )
+    parser.add_argument(
+        '--max-volume',
+        type=float,
+        default=1000000,
+        help='Maximum volume filter in USD (default: 1000000)'
     )
     parser.add_argument(
         '--duration',

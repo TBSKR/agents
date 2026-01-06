@@ -2,7 +2,7 @@ import asyncio
 import json
 import threading
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 
 from agents.polymarket.gamma import GammaMarketClient
@@ -19,6 +19,9 @@ class MarketSnapshot:
     liquidity: Optional[float]
     spread: Optional[float]
     active: bool
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    spread_pct: Optional[float] = None
     
     def get_price_for_outcome(self, outcome: str) -> Optional[float]:
         try:
@@ -36,7 +39,10 @@ class MarketSnapshot:
             'volume': self.volume,
             'liquidity': self.liquidity,
             'spread': self.spread,
-            'active': self.active
+            'active': self.active,
+            'best_bid': self.best_bid,
+            'best_ask': self.best_ask,
+            'spread_pct': self.spread_pct,
         }
 
 
@@ -67,6 +73,16 @@ class MarketTracker:
                 outcome_prices = json.loads(outcome_prices)
             outcome_prices = [float(p) for p in outcome_prices]
 
+            best_bid, best_ask = _extract_best_bid_ask(market_data)
+            spread_abs, spread_pct = _calculate_spread(
+                outcome_prices=outcome_prices,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                fallback_spread=market_data.get('spread'),
+            )
+            if spread_abs is None:
+                spread_abs = 0.0
+
             snapshot = MarketSnapshot(
                 market_id=str(market_id),
                 question=market_data.get('question', ''),
@@ -74,8 +90,11 @@ class MarketTracker:
                 outcome_prices=outcome_prices,
                 volume=float(market_data.get('volume', 0) or 0),
                 liquidity=float(market_data.get('liquidity', 0) or 0),
-                spread=float(market_data.get('spread', 0) or 0),
-                active=market_data.get('active', False)
+                spread=spread_abs,
+                active=market_data.get('active', False),
+                best_bid=best_bid,
+                best_ask=best_ask,
+                spread_pct=spread_pct,
             )
             
             self._cache[market_id] = snapshot
@@ -279,6 +298,56 @@ class MarketTracker:
             'liquidity': snapshot.liquidity,
             'spread': snapshot.spread
         }
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_best_bid_ask(market_data: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    best_bid = _coerce_float(
+        market_data.get("bestBid")
+        or market_data.get("best_bid")
+        or market_data.get("bestBidPrice")
+        or market_data.get("best_bid_price")
+    )
+    best_ask = _coerce_float(
+        market_data.get("bestAsk")
+        or market_data.get("best_ask")
+        or market_data.get("bestAskPrice")
+        or market_data.get("best_ask_price")
+    )
+    return best_bid, best_ask
+
+
+def _calculate_spread(
+    outcome_prices: List[float],
+    best_bid: Optional[float],
+    best_ask: Optional[float],
+    fallback_spread: Any = None,
+) -> Tuple[Optional[float], Optional[float]]:
+    if best_bid is not None and best_ask is not None:
+        spread_abs = max(0.0, best_ask - best_bid)
+        mid_price = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else None
+        spread_pct = spread_abs / mid_price if mid_price else None
+        return spread_abs, spread_pct
+
+    if len(outcome_prices) >= 2:
+        yes_price = outcome_prices[0]
+        no_price = outcome_prices[1]
+        spread_abs = abs(1.0 - (yes_price + no_price))
+        spread_pct = spread_abs / 0.5
+        return spread_abs, spread_pct
+
+    spread_abs = _coerce_float(fallback_spread)
+    if spread_abs is None:
+        return None, None
+    mid_price = outcome_prices[0] if outcome_prices else None
+    spread_pct = spread_abs / mid_price if mid_price else None
+    return spread_abs, spread_pct
 
 
 def _extract_ws_asset_id(data: Any) -> Optional[str]:

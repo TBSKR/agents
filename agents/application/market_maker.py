@@ -16,6 +16,7 @@ from agents.application.spread_model import SpreadModel
 class MarketMakerConfig:
     price_update_threshold: float = 0.005
     size_update_threshold_pct: float = 0.1
+    min_spread_pct: float = 0.025
     min_quote_price: float = 0.01
     max_quote_price: float = 0.99
     order_size_pct: float = 0.02
@@ -84,6 +85,17 @@ class MarketMaker:
             print("[MarketMaker] Missing token_id in market data")
             return False
 
+        spread_pct = self._get_spread_pct(market_data)
+        if spread_pct is not None and spread_pct < self.config.min_spread_pct:
+            if token_id in self.active_orders:
+                self.active_orders.pop(token_id, None)
+            print(
+                "[MarketMaker] Spread too tight ({:.2%}) for {}".format(
+                    spread_pct, token_id
+                )
+            )
+            return False
+
         buy_price, sell_price, buy_size, sell_size = self._preview_quotes(market_data)
         existing = self.active_orders.get(token_id, {})
 
@@ -120,6 +132,41 @@ class MarketMaker:
                 return True
 
         return False
+
+    def _get_spread_pct(self, market_data: Dict[str, Any]) -> Optional[float]:
+        spread_pct = market_data.get("spread_pct")
+        if spread_pct is not None:
+            try:
+                return float(spread_pct)
+            except (TypeError, ValueError):
+                pass
+
+        best_bid = market_data.get("best_bid")
+        best_ask = market_data.get("best_ask")
+        try:
+            best_bid = float(best_bid) if best_bid is not None else None
+            best_ask = float(best_ask) if best_ask is not None else None
+        except (TypeError, ValueError):
+            best_bid = None
+            best_ask = None
+
+        if best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > 0:
+            mid_price = (best_bid + best_ask) / 2
+            return abs(best_ask - best_bid) / mid_price if mid_price > 0 else None
+
+        spread_abs = market_data.get("spread")
+        if spread_abs is None:
+            return None
+        try:
+            spread_abs = float(spread_abs)
+        except (TypeError, ValueError):
+            return None
+        spread_abs = abs(spread_abs)
+
+        mid_price = self._get_mid_price(market_data)
+        if mid_price is None or mid_price <= 0:
+            return None
+        return spread_abs / mid_price
 
     def generate_orders(self, market_data: Dict[str, Any]) -> List[QuoteOrder]:
         market_id = market_data.get("market_id")
