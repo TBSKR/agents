@@ -17,23 +17,50 @@ from agents.polymarket.gamma import GammaMarketClient
 class PaperTrader:
     PORTFOLIO_STATE_FILE = "portfolio_state.json"
 
-    def __init__(self, initial_balance: float = 1000.0):
+    def __init__(self, initial_balance: float = 1000.0, use_realistic_fills: bool = False):
         self._agent = None
         self._arbitrage_engine = None
         self._gabagool = None
         self._watcher = None
-        
+        self._fill_simulator = None
+        self.use_realistic_fills = use_realistic_fills
+
         self.gamma = GammaMarketClient()
         self.logger = TradeLogger()
         self.market_tracker = MarketTracker()
-        
+
+        # Initialize fill simulator if using realistic fills
+        if use_realistic_fills:
+            self._init_fill_simulator()
+
         state_path = self.logger.data_dir / self.PORTFOLIO_STATE_FILE
         if state_path.exists():
             self.portfolio = PaperPortfolio.load_state(str(state_path))
+            if use_realistic_fills and self._fill_simulator:
+                self.portfolio.set_fill_simulator(self._fill_simulator)
             print(f"Loaded existing portfolio: ${self.portfolio.get_total_value():.2f}")
+            if use_realistic_fills:
+                print("  Using REALISTIC fill simulation")
         else:
-            self.portfolio = PaperPortfolio(initial_balance=initial_balance)
+            self.portfolio = PaperPortfolio(
+                initial_balance=initial_balance,
+                fill_simulator=self._fill_simulator if use_realistic_fills else None,
+                use_realistic_fills=use_realistic_fills
+            )
             print(f"Created new portfolio with ${initial_balance:.2f}")
+            if use_realistic_fills:
+                print("  Using REALISTIC fill simulation")
+
+    def _init_fill_simulator(self):
+        """Initialize the fill simulator for realistic execution."""
+        try:
+            from agents.application.fill_simulator import FillSimulator
+            self._fill_simulator = FillSimulator()
+            print("Fill simulator initialized")
+        except ImportError as e:
+            print(f"Warning: Could not initialize fill simulator: {e}")
+            self._fill_simulator = None
+            self.use_realistic_fills = False
 
     @property
     def arbitrage_engine(self):
@@ -126,7 +153,13 @@ class PaperTrader:
             
             size_match = re.findall(r"\d+\.?\d*", data[1])
             if size_match:
-                result['size'] = float(size_match[0])
+                size = float(size_match[0])
+                if size > 1:
+                    if size <= 100:
+                        size = size / 100.0
+                    else:
+                        size = 1.0
+                result['size'] = max(0.0, min(size, 1.0))
             
             side_upper = trade_output.upper()
             if "BUY" in side_upper:
@@ -240,8 +273,38 @@ class PaperTrader:
             print(f"   Edge: {edge:+.2%}" if ai_prob else "   Edge: N/A")
 
             print(f"\n8. Executing simulated {trade_params['side']}...")
-            print(f"   Price: {trade_params['price']}")
+            print(f"   Signal price: {trade_params['price']}")
+            print(f"   Market price: {market_price}")
             print(f"   Size: {trade_params['size']*100:.1f}% of portfolio")
+
+            snapshot = self.market_tracker.get_market_snapshot(market_id)
+            liquidity = snapshot.liquidity if snapshot else 5000
+            volume_24h = snapshot.volume if snapshot else 10000
+
+            market_conditions = None
+            if self.use_realistic_fills:
+                try:
+                    from agents.application.spread_model import PolymarketSpreadModel
+                    from agents.application.fill_simulator import MarketConditions
+
+                    spread_model = PolymarketSpreadModel()
+                    spread_pct = spread_model.calculate_spread(
+                        liquidity=liquidity,
+                        volume_24h=volume_24h,
+                        order_size=self.portfolio.cash_balance * trade_params['size'],
+                        price=market_price
+                    )
+                    half_spread = spread_pct / 2
+                    market_conditions = MarketConditions(
+                        mid_price=market_price,
+                        bid_price=market_price * (1 - half_spread),
+                        ask_price=market_price * (1 + half_spread),
+                        spread=spread_pct,
+                        liquidity=liquidity,
+                        volume_24h=volume_24h
+                    )
+                except Exception:
+                    market_conditions = None
 
             trade_id = self.logger.log_trade(
                 market_id=market_id,
@@ -249,7 +312,7 @@ class PaperTrader:
                 token_id=token_id,
                 outcome=ai_outcome or outcomes[outcome_idx],
                 side=trade_params['side'],
-                entry_price=trade_params['price'],
+                entry_price=market_price,
                 quantity=0,
                 entry_value=0,
                 ai_prediction=ai_prob or 0,
@@ -257,15 +320,18 @@ class PaperTrader:
                 balance_after=self.portfolio.cash_balance
             )
 
-            position = self.portfolio.execute_simulated_trade(
+            position, execution_result = self.portfolio.execute_simulated_trade(
                 market_id=market_id,
                 token_id=token_id,
                 question=question,
                 outcome=ai_outcome or outcomes[outcome_idx],
                 side=trade_params['side'],
-                price=trade_params['price'],
+                price=market_price,
                 size_pct=trade_params['size'],
-                trade_id=trade_id
+                trade_id=trade_id,
+                market_conditions=market_conditions,
+                liquidity=liquidity,
+                volume_24h=volume_24h
             )
 
             if position:
@@ -318,6 +384,8 @@ class PaperTrader:
             if position:
                 print(f"   Bought {position.quantity:.2f} shares @ ${position.entry_price:.4f}")
                 print(f"   Total cost: ${position.entry_value:.2f}")
+                if execution_result and execution_result.is_partial:
+                    print(f"   Partial fill: {execution_result.fill_rate:.1f}% filled")
             print(f"   New balance: ${self.portfolio.cash_balance:.2f}")
             print(f"   Total portfolio value: ${summary['total_value']:.2f}")
             print(f"   Total P&L: ${summary['total_pnl']:.2f} ({summary['total_return_pct']:+.2f}%)")
@@ -328,13 +396,27 @@ class PaperTrader:
                 'market_id': market_id,
                 'question': question,
                 'side': trade_params['side'],
-                'price': trade_params['price'],
+                'signal_price': trade_params['price'],
+                'executed_price': position.entry_price if position else market_price,
                 'size_pct': trade_params['size'],
                 'ai_prediction': ai_prob,
                 'market_price': market_price,
                 'edge': edge
             }
             result['position'] = position.to_dict() if position else None
+            result['execution_result'] = (
+                {
+                    'total_quantity': execution_result.total_quantity,
+                    'average_price': execution_result.average_price,
+                    'total_cost': execution_result.total_cost,
+                    'slippage_bps': execution_result.slippage_bps,
+                    'fill_rate': execution_result.fill_rate,
+                    'unfilled_quantity': execution_result.unfilled_quantity,
+                    'is_partial': execution_result.is_partial,
+                }
+                if execution_result
+                else None
+            )
 
         except Exception as e:
             result['error'] = str(e)
@@ -390,12 +472,48 @@ class PaperTrader:
         if current_price is None:
             return {'success': False, 'error': 'Could not fetch current price'}
 
-        realized_pnl = self.portfolio.close_position(token_id, current_price)
+        snapshot = self.market_tracker.get_market_snapshot(position.market_id)
+        liquidity = snapshot.liquidity if snapshot else 5000
+        volume_24h = snapshot.volume if snapshot else 10000
+
+        market_conditions = None
+        if self.use_realistic_fills:
+            try:
+                from agents.application.spread_model import PolymarketSpreadModel
+                from agents.application.fill_simulator import MarketConditions
+
+                spread_model = PolymarketSpreadModel()
+                spread_pct = spread_model.calculate_spread(
+                    liquidity=liquidity,
+                    volume_24h=volume_24h,
+                    order_size=position.quantity * current_price,
+                    price=current_price
+                )
+                half_spread = spread_pct / 2
+                market_conditions = MarketConditions(
+                    mid_price=current_price,
+                    bid_price=current_price * (1 - half_spread),
+                    ask_price=current_price * (1 + half_spread),
+                    spread=spread_pct,
+                    liquidity=liquidity,
+                    volume_24h=volume_24h
+                )
+            except Exception:
+                market_conditions = None
+
+        realized_pnl, execution_result = self.portfolio.close_position(
+            token_id,
+            current_price,
+            market_conditions=market_conditions,
+            liquidity=liquidity,
+            volume_24h=volume_24h
+        )
+        exit_price_used = execution_result.average_price if execution_result else current_price
         
         open_trades = self.logger.get_open_trades()
         for trade in open_trades:
             if trade['token_id'] == token_id:
-                self.logger.close_trade(trade['id'], current_price, realized_pnl)
+                self.logger.close_trade(trade['id'], exit_price_used, realized_pnl)
                 break
 
         self._save_portfolio_state()
@@ -403,7 +521,7 @@ class PaperTrader:
         return {
             'success': True,
             'realized_pnl': realized_pnl,
-            'exit_price': current_price
+            'exit_price': exit_price_used
         }
 
     # ==================== ARBITRAGE METHODS ====================

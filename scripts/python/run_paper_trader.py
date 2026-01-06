@@ -35,20 +35,24 @@ from agents.application.gabagool_trader import print_positions as print_gabagool
 
 def cmd_trade(args):
     """Execute a paper trading cycle."""
-    trader = PaperTrader(initial_balance=args.balance)
+    trader = PaperTrader(initial_balance=args.balance, use_realistic_fills=args.realistic)
     result = trader.execute_paper_trade_cycle()
-    
+
     if result['success']:
         print("\nTrade completed successfully!")
+        if args.realistic and result.get('execution_result'):
+            exec_result = result['execution_result']
+            if isinstance(exec_result, dict) and 'slippage_bps' in exec_result:
+                print(f"  Slippage: {exec_result['slippage_bps']:.1f} bps")
     else:
         print(f"\nTrade failed: {result.get('error', 'Unknown error')}")
-    
+
     return 0 if result['success'] else 1
 
 
 def cmd_auto(args):
     """Run multiple trades and manage positions."""
-    trader = PaperTrader(initial_balance=args.balance)
+    trader = PaperTrader(initial_balance=args.balance, use_realistic_fills=args.realistic)
     strategy = args.strategy
     
     print("\n" + "="*60)
@@ -154,7 +158,7 @@ def cmd_auto(args):
 
 def cmd_scan(args):
     """Scan for arbitrage opportunities."""
-    trader = PaperTrader(initial_balance=args.balance)
+    trader = PaperTrader(initial_balance=args.balance, use_realistic_fills=args.realistic)
     
     print(f"\n🔍 Scanning for arbitrage opportunities (min edge: {args.min_edge}%)...")
     
@@ -176,7 +180,7 @@ def cmd_scan(args):
 
 def cmd_status(args):
     """Show current portfolio status."""
-    trader = PaperTrader(initial_balance=args.balance)
+    trader = PaperTrader(initial_balance=args.balance, use_realistic_fills=getattr(args, 'realistic', False))
     status = trader.get_status()
     
     portfolio = status['portfolio']
@@ -294,12 +298,26 @@ def main():
         default=1000.0,
         help='Initial balance for new portfolio (default: 1000)'
     )
-    
+    parser.add_argument(
+        '--realistic', '-r',
+        action='store_true',
+        default=False,
+        help='Use realistic fill simulation (variable slippage, partial fills)'
+    )
+
+    realistic_parent = argparse.ArgumentParser(add_help=False)
+    realistic_parent.add_argument(
+        '--realistic', '-r',
+        action='store_true',
+        default=False,
+        help='Use realistic fill simulation (variable slippage, partial fills)'
+    )
+
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
-    subparsers.add_parser('trade', help='Execute a single paper trade')
+    subparsers.add_parser('trade', help='Execute a single paper trade', parents=[realistic_parent])
     
-    auto_parser = subparsers.add_parser('auto', help='Run multiple trades + manage positions')
+    auto_parser = subparsers.add_parser('auto', help='Run multiple trades + manage positions', parents=[realistic_parent])
     auto_parser.add_argument('--count', '-c', type=int, default=3, help='Number of trades to execute (default: 3)')
     auto_parser.add_argument('--take-profit', '-tp', type=float, default=20.0, help='Take profit at X%% gain (default: 20)')
     auto_parser.add_argument('--stop-loss', '-sl', type=float, default=15.0, help='Stop loss at X%% loss (default: 15)')
@@ -307,22 +325,22 @@ def main():
                              help='Trading strategy: ai, arbitrage, gabagool (recommended), mixed')
     auto_parser.add_argument('--min-edge', '-e', type=float, default=0.5, help='Minimum arbitrage edge %% (default: 0.5)')
     
-    scan_parser = subparsers.add_parser('scan', help='Scan for arbitrage opportunities')
+    scan_parser = subparsers.add_parser('scan', help='Scan for arbitrage opportunities', parents=[realistic_parent])
     scan_parser.add_argument('--min-edge', '-e', type=float, default=0.5, help='Minimum edge %% (default: 0.5)')
     scan_parser.add_argument('--min-liquidity', '-l', type=float, default=100, help='Minimum liquidity $ (default: 100)')
     scan_parser.add_argument('--limit', '-n', type=int, default=10, help='Max opportunities to show (default: 10)')
     scan_parser.add_argument('--execute', '-x', type=int, default=0, help='Execute top N opportunities (default: 0, just scan)')
     
-    subparsers.add_parser('positions', help='Show Gabagool strategy positions')
+    subparsers.add_parser('positions', help='Show Gabagool strategy positions', parents=[realistic_parent])
     
-    watch_parser = subparsers.add_parser('watch', help='Watch markets for opportunities')
+    watch_parser = subparsers.add_parser('watch', help='Watch markets for opportunities', parents=[realistic_parent])
     watch_parser.add_argument('--duration', '-d', type=float, default=60, help='Watch duration in seconds (default: 60)')
     
-    subparsers.add_parser('status', help='Show portfolio status')
-    subparsers.add_parser('export', help='Export data to CSV')
-    subparsers.add_parser('backup', help='Backup data to JSON')
-    subparsers.add_parser('report', help='Generate performance report')
-    subparsers.add_parser('update', help='Update position prices')
+    subparsers.add_parser('status', help='Show portfolio status', parents=[realistic_parent])
+    subparsers.add_parser('export', help='Export data to CSV', parents=[realistic_parent])
+    subparsers.add_parser('backup', help='Backup data to JSON', parents=[realistic_parent])
+    subparsers.add_parser('report', help='Generate performance report', parents=[realistic_parent])
+    subparsers.add_parser('update', help='Update position prices', parents=[realistic_parent])
     
     args = parser.parse_args()
     

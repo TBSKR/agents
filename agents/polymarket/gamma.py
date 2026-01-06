@@ -1,7 +1,6 @@
 import httpx
 import json
 
-from agents.polymarket.polymarket import Polymarket
 from agents.utils.objects import Market, PolymarketEvent, ClobReward, Tag
 
 
@@ -184,5 +183,6 @@ class GammaMarketClient:
 if __name__ == "__main__":
     gamma = GammaMarketClient()
     market = gamma.get_market("253123")
+    from agents.polymarket.polymarket import Polymarket
     poly = Polymarket()
     object = poly.map_api_to_market(market)
