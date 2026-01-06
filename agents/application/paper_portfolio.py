@@ -1,7 +1,10 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import json
+
+if TYPE_CHECKING:
+    from agents.application.fill_simulator import FillSimulator, ExecutionResult, MarketConditions
 
 
 @dataclass
@@ -48,14 +51,45 @@ class Position:
 
 class PaperPortfolio:
     INITIAL_BALANCE = 1000.0
-    SLIPPAGE_RATE = 0.001  # 0.1% slippage
+    LEGACY_SLIPPAGE_RATE = 0.001  # 0.1% slippage (legacy fallback)
 
-    def __init__(self, initial_balance: float = None):
+    def __init__(
+        self,
+        initial_balance: float = None,
+        fill_simulator: "FillSimulator" = None,
+        use_realistic_fills: bool = True
+    ):
+        """
+        Initialize the paper portfolio.
+
+        Args:
+            initial_balance: Starting cash balance
+            fill_simulator: Optional FillSimulator for realistic execution
+            use_realistic_fills: If True and fill_simulator provided, use realistic fills
+        """
         self.initial_balance = initial_balance or self.INITIAL_BALANCE
         self.cash_balance = self.initial_balance
         self.positions: Dict[str, Position] = {}  # keyed by token_id
         self.realized_pnl = 0.0
         self.total_trades = 0
+        self._fill_simulator = fill_simulator
+        self._use_realistic_fills = use_realistic_fills
+
+    @property
+    def fill_simulator(self) -> Optional["FillSimulator"]:
+        """Get the fill simulator, creating one if realistic fills enabled but none set."""
+        if self._use_realistic_fills and self._fill_simulator is None:
+            try:
+                from agents.application.fill_simulator import FillSimulator
+                self._fill_simulator = FillSimulator()
+            except ImportError:
+                self._use_realistic_fills = False
+        return self._fill_simulator
+
+    def set_fill_simulator(self, simulator: "FillSimulator"):
+        """Set or replace the fill simulator."""
+        self._fill_simulator = simulator
+        self._use_realistic_fills = simulator is not None
 
     def get_total_value(self) -> float:
         positions_value = sum(p.current_value for p in self.positions.values())
@@ -87,8 +121,30 @@ class PaperPortfolio:
         side: str,
         price: float,
         size_pct: float,
-        trade_id: int
-    ) -> Optional[Position]:
+        trade_id: int,
+        market_conditions: "MarketConditions" = None,
+        liquidity: float = 5000,
+        volume_24h: float = 10000
+    ) -> Tuple[Optional[Position], Optional["ExecutionResult"]]:
+        """
+        Execute a simulated trade with optional realistic fill simulation.
+
+        Args:
+            market_id: Market identifier
+            token_id: Token identifier
+            question: Market question
+            outcome: Outcome being traded
+            side: "BUY" or "SELL"
+            price: Market price
+            size_pct: Percentage of available capital/position to trade
+            trade_id: Trade identifier
+            market_conditions: Optional MarketConditions for realistic fills
+            liquidity: Estimated market liquidity (used if market_conditions not provided)
+            volume_24h: 24h trading volume (used if market_conditions not provided)
+
+        Returns:
+            Tuple of (Position or None, ExecutionResult or None)
+        """
         if side == "BUY":
             trade_amount = self.cash_balance * size_pct
         else:
@@ -96,18 +152,38 @@ class PaperPortfolio:
                 position = self.positions[token_id]
                 trade_amount = position.current_value * size_pct
             else:
-                return None
+                return None, None
 
         valid, error = self.validate_trade(side, trade_amount if side == "BUY" else 0)
         if not valid:
             print(f"Trade validation failed: {error}")
-            return None
+            return None, None
 
-        if side == "BUY":
-            final_price = price * (1 + self.SLIPPAGE_RATE)
+        execution_result = None
+
+        # Use realistic fill simulation if available
+        if self._use_realistic_fills and self.fill_simulator is not None:
+            execution_result = self._execute_with_fill_simulator(
+                side=side,
+                price=price,
+                trade_amount=trade_amount,
+                market_conditions=market_conditions,
+                liquidity=liquidity,
+                volume_24h=volume_24h
+            )
+            final_price = execution_result.average_price
+            quantity = execution_result.total_quantity
+            final_cost = execution_result.total_cost
+        else:
+            # Legacy fixed slippage
+            if side == "BUY":
+                final_price = price * (1 + self.LEGACY_SLIPPAGE_RATE)
+            else:
+                final_price = price * (1 - self.LEGACY_SLIPPAGE_RATE)
             quantity = trade_amount / final_price
             final_cost = quantity * final_price
 
+        if side == "BUY":
             self.cash_balance -= final_cost
 
             if token_id in self.positions:
@@ -139,20 +215,19 @@ class PaperPortfolio:
         else:  # SELL
             if token_id not in self.positions:
                 print(f"No position to sell for token {token_id}")
-                return None
+                return None, execution_result
 
             position = self.positions[token_id]
-            final_price = price * (1 - self.SLIPPAGE_RATE)
-            
+
             sell_quantity = position.quantity * size_pct
             sell_value = sell_quantity * final_price
-            
+
             entry_cost_for_sold = (sell_quantity / position.quantity) * position.entry_value
             realized = sell_value - entry_cost_for_sold
             self.realized_pnl += realized
-            
+
             self.cash_balance += sell_value
-            
+
             remaining_quantity = position.quantity - sell_quantity
             if remaining_quantity < 0.0001:
                 del self.positions[token_id]
@@ -162,24 +237,105 @@ class PaperPortfolio:
                 position.update_valuation(position.current_price)
 
         self.total_trades += 1
-        return position if side == "BUY" else None
+        return (position if side == "BUY" else None), execution_result
 
-    def close_position(self, token_id: str, exit_price: float) -> float:
+    def _execute_with_fill_simulator(
+        self,
+        side: str,
+        price: float,
+        trade_amount: float,
+        market_conditions: "MarketConditions" = None,
+        liquidity: float = 5000,
+        volume_24h: float = 10000
+    ) -> "ExecutionResult":
+        """
+        Execute trade using the fill simulator.
+
+        Args:
+            side: "BUY" or "SELL"
+            price: Market price
+            trade_amount: Dollar amount to trade
+            market_conditions: Optional pre-built market conditions
+            liquidity: Estimated liquidity
+            volume_24h: 24h volume
+
+        Returns:
+            ExecutionResult with fill details
+        """
+        from agents.application.fill_simulator import (
+            FillSimulator, MarketConditions, create_market_conditions_from_price
+        )
+
+        # Build market conditions if not provided
+        if market_conditions is None:
+            market_conditions = create_market_conditions_from_price(
+                price=price,
+                liquidity=liquidity,
+                volume_24h=volume_24h
+            )
+
+        # Calculate quantity from trade amount
+        quantity = trade_amount / price
+
+        # Simulate the execution
+        return self.fill_simulator.simulate_market_order(
+            side=side,
+            quantity=quantity,
+            conditions=market_conditions
+        )
+
+    def close_position(
+        self,
+        token_id: str,
+        exit_price: float,
+        market_conditions: "MarketConditions" = None,
+        liquidity: float = 5000,
+        volume_24h: float = 10000
+    ) -> Tuple[float, Optional["ExecutionResult"]]:
+        """
+        Close an existing position.
+
+        Args:
+            token_id: Token to close position for
+            exit_price: Current market price
+            market_conditions: Optional MarketConditions for realistic fills
+            liquidity: Estimated liquidity
+            volume_24h: 24h volume
+
+        Returns:
+            Tuple of (realized_pnl, ExecutionResult or None)
+        """
         if token_id not in self.positions:
-            return 0.0
+            return 0.0, None
 
         position = self.positions[token_id]
-        final_price = exit_price * (1 - self.SLIPPAGE_RATE)
+        execution_result = None
+
+        # Use realistic fill simulation if available
+        if self._use_realistic_fills and self.fill_simulator is not None:
+            trade_amount = position.quantity * exit_price
+            execution_result = self._execute_with_fill_simulator(
+                side="SELL",
+                price=exit_price,
+                trade_amount=trade_amount,
+                market_conditions=market_conditions,
+                liquidity=liquidity,
+                volume_24h=volume_24h
+            )
+            final_price = execution_result.average_price
+        else:
+            final_price = exit_price * (1 - self.LEGACY_SLIPPAGE_RATE)
+
         exit_value = position.quantity * final_price
-        
+
         realized = exit_value - position.entry_value
         self.realized_pnl += realized
         self.cash_balance += exit_value
-        
+
         del self.positions[token_id]
         self.total_trades += 1
-        
-        return realized
+
+        return realized, execution_result
 
     def update_position_prices(self, price_updates: Dict[str, float]):
         for token_id, price in price_updates.items():
