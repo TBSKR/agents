@@ -9,7 +9,8 @@ Filters out volatile/sports markets to reduce risk of reversals.
 """
 
 import json
-from typing import List, Dict, Any
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import httpx
 
@@ -55,6 +56,12 @@ class EndgameOpportunity:
     tags: List[str]           # Raw tags from API
     volume: float
     liquidity: float
+    # New fields for enhanced filtering
+    spread: float = 0.0                       # Bid-ask spread
+    days_until_resolution: Optional[float] = None
+    time_penalty: float = 0.0                 # Edge penalty for long duration
+    adjusted_edge: float = 0.0                # edge * (1 - time_penalty)
+    annualized_return: float = 0.0            # Annualized ROI
 
     def to_dict(self) -> dict:
         return {
@@ -70,7 +77,11 @@ class EndgameOpportunity:
             'market_type': self.market_type,
             'tags': self.tags,
             'volume': self.volume,
-            'liquidity': self.liquidity
+            'liquidity': self.liquidity,
+            'spread': self.spread,
+            'days_until_resolution': self.days_until_resolution,
+            'adjusted_edge': self.adjusted_edge,
+            'annualized_return': self.annualized_return
         }
 
 
@@ -87,9 +98,61 @@ class EndgameSweepEngine:
     MIN_PRICE = 0.95
     MAX_PRICE = 0.99
     MIN_LIQUIDITY = 500
+    MIN_LIQUIDITY_PER_OUTCOME = 200  # $200 minimum
+    MAX_SPREAD = 0.10                # 10% max spread
+
+    # Resolution time penalties
+    SHORT_TERM_DAYS = 7       # No penalty
+    MEDIUM_TERM_DAYS = 30     # 10% edge penalty
+    LONG_TERM_DAYS = 90       # 25% edge penalty
+    VERY_LONG_TERM_DAYS = 180 # 50% edge penalty
 
     def __init__(self):
         self.gamma = GammaMarketClient()
+
+    def _parse_end_date(self, end_date_str: str) -> Optional[datetime]:
+        """Parse end date string to datetime."""
+        if not end_date_str:
+            return None
+
+        formats = [
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%d"
+        ]
+
+        for fmt in formats:
+            try:
+                return datetime.strptime(end_date_str, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        return None
+
+    def _calculate_days_until_resolution(self, end_date_str: str) -> Optional[float]:
+        """Calculate days until market resolution."""
+        end_dt = self._parse_end_date(end_date_str)
+        if not end_dt:
+            return None
+
+        now = datetime.now(timezone.utc)
+        delta = end_dt - now
+        return max(0, delta.total_seconds() / 86400)
+
+    def _calculate_time_penalty(self, days: Optional[float]) -> float:
+        """Calculate edge penalty based on time to resolution."""
+        if days is None:
+            return 0.25  # Unknown = 25% penalty
+
+        if days <= self.SHORT_TERM_DAYS:
+            return 0.0
+        elif days <= self.MEDIUM_TERM_DAYS:
+            return 0.10
+        elif days <= self.LONG_TERM_DAYS:
+            return 0.25
+        elif days <= self.VERY_LONG_TERM_DAYS:
+            return 0.50
+        else:
+            return 0.75
 
     def _classify_market_type(self, event: Dict, market: Dict) -> str:
         """
@@ -214,13 +277,21 @@ class EndgameSweepEngine:
         max_price: float = 0.99,
         exclude_sports: bool = True,
         min_liquidity: float = 500,
-        limit: int = 20
+        max_days: int = 365,
+        limit: int = 20,
+        sort_by: str = "annualized"  # "edge" or "annualized"
     ) -> List[EndgameOpportunity]:
         """
         Scan for endgame sweep opportunities.
 
         Finds markets where YES or NO price is 95-99% (near certain).
         Filters out sports if requested.
+
+        Enhanced filtering:
+        - Uses liquidityClob if available
+        - Checks spread
+        - Checks if accepting orders
+        - Applies time penalty for long-duration markets
         """
         opportunities = []
 
@@ -235,6 +306,10 @@ class EndgameSweepEngine:
                 if market.get('active') is False or market.get('closed') is True:
                     continue
 
+                # Skip if not accepting orders
+                if market.get('acceptingOrders') is False:
+                    continue
+
                 # Get prices
                 prices = self._parse_outcome_prices(market)
                 if len(prices) < 2:
@@ -245,10 +320,26 @@ class EndgameSweepEngine:
                 if len(token_ids) < 2:
                     continue
 
-                # Check liquidity
-                liquidity = float(market.get('liquidity', 0) or 0)
+                # Check liquidity - prefer CLOB liquidity
+                liquidity_clob = float(market.get('liquidityClob', 0) or 0)
+                liquidity = liquidity_clob if liquidity_clob > 0 else float(market.get('liquidity', 0) or 0)
                 if liquidity < min_liquidity:
                     continue
+
+                # Check spread
+                spread = float(market.get('spread', 0) or 0)
+                if spread > self.MAX_SPREAD:
+                    continue
+
+                # Get end date and calculate time-related fields
+                end_date = market.get('endDate', '')
+                days_until = self._calculate_days_until_resolution(end_date)
+
+                # Filter by max days
+                if days_until is not None and days_until > max_days:
+                    continue
+
+                time_penalty = self._calculate_time_penalty(days_until)
 
                 # Classify market type
                 market_type = self._classify_market_type(event, market)
@@ -268,6 +359,15 @@ class EndgameSweepEngine:
                 for i, price in enumerate(prices[:2]):  # Only check YES (0) and NO (1)
                     if min_price <= price <= max_price:
                         edge = 1.0 - price
+                        edge_pct = (edge / price) * 100 if price > 0 else 0
+                        adjusted_edge = edge * (1 - time_penalty)
+
+                        # Calculate annualized return
+                        if days_until and days_until > 0:
+                            annualized_return = (adjusted_edge / price) * (365 / days_until) * 100
+                        else:
+                            annualized_return = edge_pct
+
                         opp = EndgameOpportunity(
                             market_id=str(market.get('id', '')),
                             question=market.get('question', ''),
@@ -275,18 +375,26 @@ class EndgameSweepEngine:
                             price=price,
                             expected_payout=1.0,
                             edge=edge,
-                            edge_pct=(edge / price) * 100 if price > 0 else 0,
+                            edge_pct=edge_pct,
                             token_id=token_ids[i] if i < len(token_ids) else '',
-                            end_date=market.get('endDate', ''),
+                            end_date=end_date,
                             market_type=market_type,
                             tags=self._extract_tag_labels(event),
                             volume=float(market.get('volume', 0) or 0),
-                            liquidity=liquidity
+                            liquidity=liquidity,
+                            spread=spread,
+                            days_until_resolution=days_until,
+                            time_penalty=time_penalty,
+                            adjusted_edge=adjusted_edge,
+                            annualized_return=annualized_return
                         )
                         opportunities.append(opp)
 
-        # Sort by edge (lower price = higher edge)
-        opportunities = sorted(opportunities, key=lambda x: -x.edge)
+        # Sort by chosen metric
+        if sort_by == "annualized":
+            opportunities = sorted(opportunities, key=lambda x: -x.annualized_return)
+        else:
+            opportunities = sorted(opportunities, key=lambda x: -x.edge)
 
         return opportunities[:limit]
 
@@ -352,7 +460,7 @@ class EndgameSweepEngine:
         return opportunities[:limit]
 
 
-def print_endgame_opportunities(opportunities: List[EndgameOpportunity]):
+def print_endgame_opportunities(opportunities: List[EndgameOpportunity], show_details: bool = False):
     """Pretty print endgame sweep opportunities."""
     if not opportunities:
         print("No endgame sweep opportunities found.")
@@ -367,12 +475,26 @@ def print_endgame_opportunities(opportunities: List[EndgameOpportunity]):
         print(f"\n{i}. {opp.question[:55]}{'...' if len(opp.question) > 55 else ''}")
         print(f"   Outcome: {opp.outcome} @ ${opp.price:.4f}")
         print(f"   Edge: ${opp.edge:.4f} ({opp.edge_pct:.2f}%)")
-        print(f"   Type: {opp.market_type.upper()}")
-        if opp.tags:
-            print(f"   Tags: {', '.join(opp.tags[:3])}")
-        print(f"   Liquidity: ${opp.liquidity:,.0f}")
-        if opp.end_date:
-            print(f"   Ends: {opp.end_date[:10]}")
+
+        # Show time penalty and adjusted edge
+        if opp.time_penalty > 0:
+            print(f"   Adjusted Edge: ${opp.adjusted_edge:.4f} (-{opp.time_penalty*100:.0f}% time penalty)")
+
+        # Show resolution time and annualized return
+        if opp.days_until_resolution is not None:
+            days = opp.days_until_resolution
+            if days < 1:
+                print(f"   Resolution: < 1 day | Annualized: {opp.annualized_return:.1f}%")
+            else:
+                print(f"   Resolution: {days:.0f} days | Annualized: {opp.annualized_return:.1f}%")
+
+        # Show liquidity and spread
+        print(f"   Liquidity: ${opp.liquidity:,.0f} | Spread: {opp.spread*100:.1f}%")
+
+        if show_details:
+            print(f"   Type: {opp.market_type.upper()}")
+            if opp.tags:
+                print(f"   Tags: {', '.join(opp.tags[:3])}")
 
     print("\n" + "="*70)
 

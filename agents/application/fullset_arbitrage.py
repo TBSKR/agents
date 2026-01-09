@@ -8,7 +8,8 @@ CRITICAL: Uses /events endpoint (not /markets) to find all markets belonging to 
 """
 
 import json
-from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import httpx
 
@@ -29,6 +30,14 @@ class FullSetOpportunity:
     token_ids: List[str]              # YES token ID from each market
     num_outcomes: int                 # Number of outcomes (3+)
     liquidity: float                  # Minimum liquidity across all markets
+    # New fields for enhanced filtering
+    liquidity_per_outcome: List[float] = None  # Per-outcome breakdown
+    avg_spread: float = 0.0           # Average spread across outcomes
+    end_date: str = ""                # Resolution date
+    days_until_resolution: Optional[float] = None
+    time_penalty: float = 0.0         # Edge penalty for long duration
+    adjusted_edge: float = 0.0        # edge * (1 - time_penalty)
+    annualized_return: float = 0.0    # Annualized ROI
 
     def to_dict(self) -> dict:
         return {
@@ -41,7 +50,11 @@ class FullSetOpportunity:
             'edge_pct': self.edge_pct,
             'token_ids': self.token_ids,
             'num_outcomes': self.num_outcomes,
-            'liquidity': self.liquidity
+            'liquidity': self.liquidity,
+            'avg_spread': self.avg_spread,
+            'days_until_resolution': self.days_until_resolution,
+            'adjusted_edge': self.adjusted_edge,
+            'annualized_return': self.annualized_return
         }
 
 
@@ -55,10 +68,65 @@ class FullSetArbitrageEngine:
 
     MIN_EDGE = 0.005       # 0.5% minimum edge
     MIN_OUTCOMES = 3       # At least 3 outcomes (exclude binary markets)
-    MIN_LIQUIDITY = 500    # Minimum liquidity per outcome
+    MIN_LIQUIDITY = 500    # Minimum total market liquidity
+    MIN_LIQUIDITY_PER_OUTCOME = 200  # $200 minimum per outcome
+    MAX_SPREAD = 0.10      # 10% max spread allowed
+
+    # Resolution time penalties
+    SHORT_TERM_DAYS = 7       # No penalty
+    MEDIUM_TERM_DAYS = 30     # 10% edge penalty
+    LONG_TERM_DAYS = 90       # 25% edge penalty
+    VERY_LONG_TERM_DAYS = 180 # 50% edge penalty
 
     def __init__(self):
         self.gamma = GammaMarketClient()
+
+    def _parse_end_date(self, end_date_str: str) -> Optional[datetime]:
+        """Parse end date string to datetime."""
+        if not end_date_str:
+            return None
+
+        formats = [
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%d"
+        ]
+
+        for fmt in formats:
+            try:
+                return datetime.strptime(end_date_str, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        return None
+
+    def _calculate_days_until_resolution(self, end_date_str: str) -> Optional[float]:
+        """Calculate days until market resolution."""
+        end_dt = self._parse_end_date(end_date_str)
+        if not end_dt:
+            return None
+
+        now = datetime.now(timezone.utc)
+        delta = end_dt - now
+        return max(0, delta.total_seconds() / 86400)
+
+    def _calculate_time_penalty(self, days: Optional[float]) -> float:
+        """
+        Calculate edge penalty based on time to resolution.
+        Longer duration = higher penalty (opportunity cost).
+        """
+        if days is None:
+            return 0.25  # Unknown = 25% penalty
+
+        if days <= self.SHORT_TERM_DAYS:
+            return 0.0
+        elif days <= self.MEDIUM_TERM_DAYS:
+            return 0.10
+        elif days <= self.LONG_TERM_DAYS:
+            return 0.25
+        elif days <= self.VERY_LONG_TERM_DAYS:
+            return 0.50
+        else:
+            return 0.75  # 75% penalty for >180 days
 
     def get_multi_outcome_events(self, limit: int = 200) -> List[Dict]:
         """
@@ -136,6 +204,12 @@ class FullSetArbitrageEngine:
         2. For each market, extract the YES price (outcomePrices[0])
         3. Sum all YES prices
         4. If sum < 1.0, we have arbitrage
+
+        Enhanced filtering:
+        - Uses liquidityClob if available (better for order book depth)
+        - Checks spread (skip if > 10%)
+        - Checks if market is accepting orders
+        - Applies time penalty for long-duration markets
         """
         try:
             markets = event.get('markets', [])
@@ -146,11 +220,16 @@ class FullSetArbitrageEngine:
             outcome_prices = []
             token_ids = []
             liquidities = []
+            spreads = []
             valid_markets = []
 
             for market in markets:
                 # Skip inactive or closed markets
                 if market.get('active') is False or market.get('closed') is True:
+                    continue
+
+                # Skip if not accepting orders
+                if market.get('acceptingOrders') is False:
                     continue
 
                 # Get the YES price (first outcome price)
@@ -163,21 +242,28 @@ class FullSetArbitrageEngine:
                 if not market_token_ids:
                     continue
 
-                # Get market liquidity
-                liquidity = float(market.get('liquidity', 0) or 0)
-                if liquidity < self.MIN_LIQUIDITY:
+                # Get market liquidity - prefer CLOB liquidity if available
+                liquidity_clob = float(market.get('liquidityClob', 0) or 0)
+                liquidity = liquidity_clob if liquidity_clob > 0 else float(market.get('liquidity', 0) or 0)
+
+                # Skip if insufficient liquidity per outcome
+                if liquidity < self.MIN_LIQUIDITY_PER_OUTCOME:
+                    continue
+
+                # Check spread - skip if too wide
+                spread = float(market.get('spread', 0) or 0)
+                if spread > self.MAX_SPREAD:
                     continue
 
                 # Extract outcome name from market question
                 question = market.get('question', '')
-                # For multi-outcome events, the question often IS the outcome
-                # e.g., "Donald Trump" in "Who wins 2028 election?"
                 outcome_name = market.get('groupItemTitle') or question
 
                 outcomes.append(outcome_name)
                 outcome_prices.append(prices[0])  # YES price
                 token_ids.append(market_token_ids[0])  # YES token ID
                 liquidities.append(liquidity)
+                spreads.append(spread)
                 valid_markets.append(market)
 
             # Need at least MIN_OUTCOMES valid markets
@@ -191,6 +277,24 @@ class FullSetArbitrageEngine:
             if edge <= 0:
                 return None
 
+            # Calculate edge percentage
+            edge_pct = (edge / total_cost) * 100 if total_cost > 0 else 0
+
+            # Calculate average spread
+            avg_spread = sum(spreads) / len(spreads) if spreads else 0
+
+            # Get end date and calculate time-related fields
+            end_date = event.get('endDate', '')
+            days_until = self._calculate_days_until_resolution(end_date)
+            time_penalty = self._calculate_time_penalty(days_until)
+            adjusted_edge = edge * (1 - time_penalty)
+
+            # Calculate annualized return
+            if days_until and days_until > 0:
+                annualized_return = (adjusted_edge / total_cost) * (365 / days_until) * 100
+            else:
+                annualized_return = edge_pct  # If resolution is immediate
+
             return FullSetOpportunity(
                 event_id=str(event.get('id', '')),
                 event_title=event.get('title', ''),
@@ -199,10 +303,17 @@ class FullSetArbitrageEngine:
                 outcome_prices=outcome_prices,
                 total_cost=total_cost,
                 edge=edge,
-                edge_pct=(edge / total_cost) * 100 if total_cost > 0 else 0,
+                edge_pct=edge_pct,
                 token_ids=token_ids,
                 num_outcomes=len(valid_markets),
-                liquidity=min(liquidities) if liquidities else 0
+                liquidity=min(liquidities) if liquidities else 0,
+                liquidity_per_outcome=liquidities,
+                avg_spread=avg_spread,
+                end_date=end_date,
+                days_until_resolution=days_until,
+                time_penalty=time_penalty,
+                adjusted_edge=adjusted_edge,
+                annualized_return=annualized_return
             )
 
         except Exception as e:
@@ -272,7 +383,9 @@ class FullSetArbitrageEngine:
         min_edge_pct: float = 0.5,
         min_liquidity: float = 500,
         min_outcomes: int = 3,
-        limit: int = 10
+        max_days: int = 365,
+        limit: int = 10,
+        sort_by: str = "annualized"  # "edge" or "annualized"
     ) -> List[FullSetOpportunity]:
         """Find the best full-set arbitrage opportunities matching criteria."""
 
@@ -286,17 +399,29 @@ class FullSetArbitrageEngine:
         self.MIN_OUTCOMES = original_min
 
         # Filter by criteria
-        filtered = [
-            opp for opp in all_opportunities
-            if opp.edge_pct >= min_edge_pct
-            and opp.liquidity >= min_liquidity
-            and opp.num_outcomes >= min_outcomes
-        ]
+        filtered = []
+        for opp in all_opportunities:
+            if opp.edge_pct < min_edge_pct:
+                continue
+            if opp.liquidity < min_liquidity:
+                continue
+            if opp.num_outcomes < min_outcomes:
+                continue
+            # Filter by max days until resolution
+            if opp.days_until_resolution is not None and opp.days_until_resolution > max_days:
+                continue
+            filtered.append(opp)
+
+        # Sort by chosen metric
+        if sort_by == "annualized":
+            filtered.sort(key=lambda x: -x.annualized_return)
+        else:
+            filtered.sort(key=lambda x: -x.edge)
 
         return filtered[:limit]
 
 
-def print_fullset_opportunities(opportunities: List[FullSetOpportunity]):
+def print_fullset_opportunities(opportunities: List[FullSetOpportunity], show_details: bool = False):
     """Pretty print full-set arbitrage opportunities."""
     if not opportunities:
         print("No full-set arbitrage opportunities found.")
@@ -312,13 +437,31 @@ def print_fullset_opportunities(opportunities: List[FullSetOpportunity]):
         print(f"   Outcomes: {opp.num_outcomes}")
         print(f"   Total Cost: ${opp.total_cost:.4f}")
         print(f"   Edge: ${opp.edge:.4f} ({opp.edge_pct:.2f}%)")
-        print(f"   Min Liquidity: ${opp.liquidity:,.0f}")
-        print("   Prices:")
-        for outcome, price in zip(opp.outcomes[:5], opp.outcome_prices[:5]):
-            outcome_short = outcome[:30] + "..." if len(outcome) > 30 else outcome
-            print(f"      {outcome_short}: ${price:.4f}")
-        if len(opp.outcomes) > 5:
-            print(f"      ... and {len(opp.outcomes) - 5} more outcomes")
+
+        # Show time penalty and adjusted edge
+        if opp.time_penalty > 0:
+            print(f"   Adjusted Edge: ${opp.adjusted_edge:.4f} (-{opp.time_penalty*100:.0f}% time penalty)")
+
+        # Show resolution time
+        if opp.days_until_resolution is not None:
+            days = opp.days_until_resolution
+            if days < 1:
+                print(f"   Resolution: < 1 day | Annualized: {opp.annualized_return:.1f}%")
+            elif days < 30:
+                print(f"   Resolution: {days:.0f} days | Annualized: {opp.annualized_return:.1f}%")
+            else:
+                print(f"   Resolution: {days:.0f} days | Annualized: {opp.annualized_return:.1f}%")
+
+        # Show liquidity info
+        print(f"   Min Liquidity: ${opp.liquidity:,.0f} | Avg Spread: {opp.avg_spread*100:.1f}%")
+
+        if show_details:
+            print("   Prices:")
+            for outcome, price in zip(opp.outcomes[:5], opp.outcome_prices[:5]):
+                outcome_short = outcome[:30] + "..." if len(outcome) > 30 else outcome
+                print(f"      {outcome_short}: ${price:.4f}")
+            if len(opp.outcomes) > 5:
+                print(f"      ... and {len(opp.outcomes) - 5} more outcomes")
 
     print("\n" + "="*70)
 
