@@ -15,7 +15,13 @@ Usage:
     python scripts/python/run_paper_trader.py backup    - Backup data to JSON
     python scripts/python/run_paper_trader.py --strategy market_maker --markets "id1,id2" --duration 15m
     python scripts/python/run_paper_trader.py --strategy market_maker --market-ids "123,456" --duration 15m
-    
+
+New Multi-Strategy Commands:
+    python scripts/python/run_paper_trader.py fullset   - Full-set arbitrage (Dutch Book) on multi-outcome markets
+    python scripts/python/run_paper_trader.py endgame   - Endgame sweeps (buy 95-99% certain outcomes)
+    python scripts/python/run_paper_trader.py oracle    - Oracle timing exploit (monitor Binance prices)
+    python scripts/python/run_paper_trader.py rewards   - View holding rewards summary (4% APY)
+
 Strategies:
     --strategy ai        - AI-driven prediction trades (default)
     --strategy arbitrage - Risk-free arbitrage trades (YES+NO < $1)
@@ -38,6 +44,26 @@ from agents.application.arbitrage_engine import print_opportunities
 from agents.application.gabagool_trader import print_positions as print_gabagool_positions
 from agents.application.market_maker import MarketMakerConfig
 from agents.polymarket.gamma import GammaMarketClient
+
+# New strategy imports
+from agents.application.fullset_arbitrage import (
+    FullSetArbitrageEngine,
+    print_fullset_opportunities
+)
+from agents.application.endgame_sweeps import (
+    EndgameSweepEngine,
+    print_endgame_opportunities
+)
+from agents.application.oracle_timing import (
+    OracleTimingEngine,
+    print_oracle_opportunities
+)
+from agents.application.rewards_tracker import (
+    HoldingRewardsTracker,
+    print_rewards_summary,
+    print_eligible_markets,
+    print_eligible_positions
+)
 
 
 def _coerce_float(value: Optional[object]) -> Optional[float]:
@@ -426,6 +452,182 @@ def cmd_watch(args):
     return 0
 
 
+def cmd_fullset(args):
+    """Scan and execute full-set (Dutch Book) arbitrage on multi-outcome markets."""
+    trader = PaperTrader(initial_balance=args.balance, use_realistic_fills=getattr(args, 'realistic', False))
+    engine = FullSetArbitrageEngine()
+
+    print(f"\nScanning for full-set arbitrage (min {args.min_outcomes} outcomes, min {args.min_edge}% edge)...")
+
+    opportunities = engine.find_best_opportunities(
+        min_edge_pct=args.min_edge,
+        min_liquidity=args.min_liquidity,
+        min_outcomes=args.min_outcomes,
+        limit=args.limit
+    )
+
+    print_fullset_opportunities(opportunities)
+
+    if opportunities and args.execute > 0:
+        print(f"\nExecuting top {min(args.execute, len(opportunities))} opportunities...")
+        for opp in opportunities[:args.execute]:
+            if trader.portfolio.cash_balance < 50:
+                print(f"\nLow cash (${trader.portfolio.cash_balance:.2f}), stopping.")
+                break
+
+            budget = trader.portfolio.cash_balance * 0.15
+            calc = engine.calculate_fullset_trade(opp, budget)
+
+            print(f"\nBuying all {opp.num_outcomes} outcomes for {opp.event_title[:40]}...")
+            print(f"   Budget: ${budget:.2f}")
+            print(f"   Guaranteed profit: ${calc['guaranteed_profit']:.2f} ({calc['profit_pct']:.2f}%)")
+
+            # Execute trades for each outcome
+            for i, (outcome, price, _) in enumerate(zip(opp.outcomes, opp.outcome_prices, opp.token_ids)):
+                qty = calc['quantities'][i]
+                cost = calc['costs'][i]
+                trader.portfolio.cash_balance -= cost
+                print(f"      {outcome[:30]}: {qty:.2f} shares @ ${price:.4f} = ${cost:.2f}")
+
+            trader.portfolio.total_trades += opp.num_outcomes
+
+        summary = trader.portfolio.get_portfolio_summary()
+        print(f"\nPortfolio: ${summary['total_value']:.2f} | Cash: ${summary['cash_balance']:.2f}")
+
+    return 0
+
+
+def cmd_endgame(args):
+    """Scan for near-certain outcomes to sweep."""
+    trader = PaperTrader(initial_balance=args.balance, use_realistic_fills=getattr(args, 'realistic', False))
+    engine = EndgameSweepEngine()
+
+    print(f"\nScanning for endgame opportunities (price {args.min_price}-{args.max_price})...")
+
+    opportunities = engine.find_best_opportunities(
+        min_price=args.min_price,
+        max_price=args.max_price,
+        exclude_sports=not args.include_sports,
+        prefer_political=True,
+        min_liquidity=args.min_liquidity,
+        limit=args.limit
+    )
+
+    print_endgame_opportunities(opportunities)
+
+    if opportunities and args.execute > 0:
+        print(f"\nExecuting top {min(args.execute, len(opportunities))} sweeps...")
+        for opp in opportunities[:args.execute]:
+            if trader.portfolio.cash_balance < 50:
+                print(f"\nLow cash (${trader.portfolio.cash_balance:.2f}), stopping.")
+                break
+
+            budget = trader.portfolio.cash_balance * 0.1
+            calc = engine.calculate_sweep_trade(opp, budget)
+
+            print(f"\nSweeping {opp.question[:40]}...")
+            print(f"   Outcome: {opp.outcome} @ ${opp.price:.4f}")
+            print(f"   Buying {calc['quantity']:.2f} shares for ${calc['cost']:.2f}")
+            print(f"   Expected profit: ${calc['guaranteed_profit']:.2f} ({calc['profit_pct']:.2f}%)")
+
+            trader.portfolio.cash_balance -= calc['cost']
+            trader.portfolio.total_trades += 1
+
+        summary = trader.portfolio.get_portfolio_summary()
+        print(f"\nPortfolio: ${summary['total_value']:.2f} | Cash: ${summary['cash_balance']:.2f}")
+
+    return 0
+
+
+def cmd_oracle(args):
+    """Monitor oracle timing opportunities."""
+    trader = PaperTrader(initial_balance=args.balance, use_realistic_fills=getattr(args, 'realistic', False))
+    engine = OracleTimingEngine()
+
+    if args.monitor:
+        print(f"\nMonitoring for oracle timing opportunities ({args.duration}s)...")
+        print("Press Ctrl+C to stop early\n")
+
+        opportunities = engine.monitor_and_alert(
+            poll_interval=args.poll_interval,
+            duration=args.duration
+        )
+
+        if opportunities:
+            print(f"\n\nFound {len(opportunities)} opportunities during monitoring:")
+            print_oracle_opportunities(opportunities)
+    else:
+        print("\nScanning for oracle timing opportunities...")
+        opportunities = engine.scan_oracle_opportunities(
+            min_edge_pct=args.min_edge,
+            limit=args.limit
+        )
+
+        print_oracle_opportunities(opportunities)
+
+        if opportunities and args.execute > 0:
+            print(f"\nExecuting top {min(args.execute, len(opportunities))} oracle trades...")
+            for opp in opportunities[:args.execute]:
+                if not opp.event_occurred:
+                    print(f"   Skipping {opp.market_id}: event not occurred yet")
+                    continue
+
+                if trader.portfolio.cash_balance < 50:
+                    print(f"\nLow cash (${trader.portfolio.cash_balance:.2f}), stopping.")
+                    break
+
+                budget = trader.portfolio.cash_balance * 0.1
+                calc = engine.calculate_oracle_trade(opp, budget)
+
+                print(f"\nOracle trade: {opp.question[:40]}...")
+                print(f"   {opp.asset} is {opp.threshold_direction} ${opp.threshold_price:,.0f}")
+                print(f"   Current: ${opp.current_price:,.2f} | Polymarket: ${opp.polymarket_price:.4f}")
+                print(f"   Buying {calc['quantity']:.2f} shares for ${calc['cost']:.2f}")
+                print(f"   Expected profit: ${calc['guaranteed_profit']:.2f}")
+
+                trader.portfolio.cash_balance -= calc['cost']
+                trader.portfolio.total_trades += 1
+
+            summary = trader.portfolio.get_portfolio_summary()
+            print(f"\nPortfolio: ${summary['total_value']:.2f} | Cash: ${summary['cash_balance']:.2f}")
+
+    return 0
+
+
+def cmd_rewards(args):
+    """Show holding rewards summary."""
+    trader = PaperTrader(initial_balance=args.balance)
+    rewards_tracker = HoldingRewardsTracker(trader.portfolio)
+
+    if args.find:
+        print("\nFinding reward-eligible markets...")
+        markets = rewards_tracker.find_reward_eligible_markets(
+            min_liquidity=args.min_liquidity,
+            limit=args.limit
+        )
+        print_eligible_markets(markets)
+
+        # Show projected rewards calculator
+        print("\n" + "="*50)
+        print("  PROJECTED REWARDS CALCULATOR")
+        print("="*50)
+        projection = rewards_tracker.calculate_projected_rewards(1000, hold_days=365)
+        print(f"  For $1,000 investment at {projection['apy']:.1f}% APY:")
+        print(f"  Daily:   ${projection['daily_reward']:.4f}")
+        print(f"  Monthly: ${projection['monthly_reward']:.2f}")
+        print(f"  Annual:  ${projection['annual_reward']:.2f}")
+        print("="*50)
+    else:
+        print_rewards_summary(rewards_tracker)
+
+        if args.verbose:
+            print("\nReward-eligible positions:")
+            positions = rewards_tracker.get_eligible_positions()
+            print_eligible_positions(positions)
+
+    return 0
+
+
 def cmd_market_maker(args):
     """Run market making loop via WebSocket updates."""
     token_ids: List[str] = []
@@ -533,13 +735,13 @@ def main():
         '--min-spread',
         type=float,
         default=0.025,
-        help='Minimum spread as decimal (default: 0.025 = 2.5%)'
+        help='Minimum spread as decimal (default: 0.025 = 2.5 percent)'
     )
     parser.add_argument(
         '--max-spread',
         type=float,
         default=0.10,
-        help='Maximum spread as decimal (default: 0.10 = 10%)'
+        help='Maximum spread as decimal (default: 0.10 = 10 percent)'
     )
     parser.add_argument(
         '--min-volume',
@@ -601,7 +803,40 @@ def main():
     subparsers.add_parser('backup', help='Backup data to JSON', parents=[realistic_parent])
     subparsers.add_parser('report', help='Generate performance report', parents=[realistic_parent])
     subparsers.add_parser('update', help='Update position prices', parents=[realistic_parent])
-    
+
+    # Full-Set Arbitrage (Dutch Book)
+    fullset_parser = subparsers.add_parser('fullset', help='Full-set arbitrage (Dutch Book) on multi-outcome markets', parents=[realistic_parent])
+    fullset_parser.add_argument('--min-edge', '-e', type=float, default=0.5, help='Minimum edge percent (default: 0.5)')
+    fullset_parser.add_argument('--min-liquidity', '-l', type=float, default=500, help='Minimum liquidity $ (default: 500)')
+    fullset_parser.add_argument('--min-outcomes', '-o', type=int, default=3, help='Minimum outcomes per event (default: 3)')
+    fullset_parser.add_argument('--limit', '-n', type=int, default=10, help='Max opportunities to show (default: 10)')
+    fullset_parser.add_argument('--execute', '-x', type=int, default=0, help='Execute top N opportunities (default: 0, just scan)')
+
+    # Endgame Sweeps
+    endgame_parser = subparsers.add_parser('endgame', help='Scan for endgame sweep opportunities (95-99 percent certain)', parents=[realistic_parent])
+    endgame_parser.add_argument('--min-price', type=float, default=0.95, help='Minimum price (default: 0.95)')
+    endgame_parser.add_argument('--max-price', type=float, default=0.99, help='Maximum price (default: 0.99)')
+    endgame_parser.add_argument('--include-sports', action='store_true', help='Include sports markets (excluded by default)')
+    endgame_parser.add_argument('--min-liquidity', '-l', type=float, default=500, help='Minimum liquidity $ (default: 500)')
+    endgame_parser.add_argument('--limit', '-n', type=int, default=10, help='Max opportunities to show (default: 10)')
+    endgame_parser.add_argument('--execute', '-x', type=int, default=0, help='Execute top N sweeps (default: 0, just scan)')
+
+    # Oracle Timing
+    oracle_parser = subparsers.add_parser('oracle', help='Oracle timing exploit (monitor external prices)', parents=[realistic_parent])
+    oracle_parser.add_argument('--monitor', '-m', action='store_true', help='Continuous monitoring mode')
+    oracle_parser.add_argument('--duration', '-d', type=float, default=3600, help='Monitoring duration in seconds (default: 3600)')
+    oracle_parser.add_argument('--poll-interval', '-p', type=float, default=5.0, help='Poll interval in seconds (default: 5)')
+    oracle_parser.add_argument('--min-edge', '-e', type=float, default=1.0, help='Minimum edge percent (default: 1.0)')
+    oracle_parser.add_argument('--limit', '-n', type=int, default=10, help='Max opportunities to show (default: 10)')
+    oracle_parser.add_argument('--execute', '-x', type=int, default=0, help='Execute top N oracle trades (default: 0, just scan)')
+
+    # Holding Rewards
+    rewards_parser = subparsers.add_parser('rewards', help='View holding rewards summary and eligible markets', parents=[realistic_parent])
+    rewards_parser.add_argument('--find', '-f', action='store_true', help='Find reward-eligible markets')
+    rewards_parser.add_argument('--verbose', '-v', action='store_true', help='Show detailed position breakdown')
+    rewards_parser.add_argument('--min-liquidity', '-l', type=float, default=1000, help='Minimum liquidity $ (default: 1000)')
+    rewards_parser.add_argument('--limit', '-n', type=int, default=20, help='Max markets to show (default: 20)')
+
     args = parser.parse_args()
     
     if args.command is None:
@@ -621,6 +856,11 @@ def main():
         'backup': cmd_backup,
         'report': cmd_report,
         'update': cmd_update,
+        # New strategy commands
+        'fullset': cmd_fullset,
+        'endgame': cmd_endgame,
+        'oracle': cmd_oracle,
+        'rewards': cmd_rewards,
     }
     
     return commands[args.command](args)

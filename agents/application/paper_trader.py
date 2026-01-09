@@ -27,6 +27,11 @@ class PaperTrader:
         self._gabagool = None
         self._watcher = None
         self._fill_simulator = None
+        # New strategy engines
+        self._fullset_engine = None
+        self._endgame_engine = None
+        self._oracle_engine = None
+        self._rewards_tracker = None
         self.use_realistic_fills = use_realistic_fills
 
         self.gamma = GammaMarketClient()
@@ -90,6 +95,34 @@ class PaperTrader:
             from agents.application.paper_executor import PaperExecutor
             self._agent = PaperExecutor()
         return self._agent
+
+    @property
+    def fullset_engine(self):
+        if self._fullset_engine is None:
+            from agents.application.fullset_arbitrage import FullSetArbitrageEngine
+            self._fullset_engine = FullSetArbitrageEngine()
+        return self._fullset_engine
+
+    @property
+    def endgame_engine(self):
+        if self._endgame_engine is None:
+            from agents.application.endgame_sweeps import EndgameSweepEngine
+            self._endgame_engine = EndgameSweepEngine()
+        return self._endgame_engine
+
+    @property
+    def oracle_engine(self):
+        if self._oracle_engine is None:
+            from agents.application.oracle_timing import OracleTimingEngine
+            self._oracle_engine = OracleTimingEngine()
+        return self._oracle_engine
+
+    @property
+    def rewards_tracker(self):
+        if self._rewards_tracker is None:
+            from agents.application.rewards_tracker import HoldingRewardsTracker
+            self._rewards_tracker = HoldingRewardsTracker(self.portfolio)
+        return self._rewards_tracker
 
     def get_all_tradeable_events(self, limit: int = 100):
         """Fetch tradeable events using Gamma API directly (no auth required).

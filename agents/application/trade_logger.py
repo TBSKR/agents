@@ -103,6 +103,21 @@ class TradeLogger:
             )
         ''')
 
+        # Rewards tracking table for holding rewards (4% APY)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rewards_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                market_id TEXT NOT NULL,
+                question TEXT,
+                position_value REAL NOT NULL,
+                reward_rate_apy REAL NOT NULL,
+                daily_reward REAL NOT NULL,
+                cumulative_rewards REAL NOT NULL
+            )
+        ''')
+
         conn.commit()
         conn.close()
 
