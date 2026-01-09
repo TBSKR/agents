@@ -286,7 +286,119 @@ def cmd_auto(args):
             budget_pct_per_trade=0.15
         )
         arb_trades = arb_result['trades_executed']
-    
+
+    elif strategy == 'fullset':
+        print("\n🔄 Running FULL-SET ARBITRAGE (Dutch Book)...")
+        opportunities = trader.fullset_engine.scan_all_events(limit=args.count * 3)
+
+        if not opportunities:
+            print("   No full-set arbitrage opportunities found")
+        else:
+            for opp in opportunities[:args.count]:
+                if trader.portfolio.cash_balance < 50:
+                    print(f"\n   Low cash (${trader.portfolio.cash_balance:.2f}), stopping")
+                    break
+
+                budget = min(100, trader.portfolio.cash_balance * 0.15)
+                trade = trader.fullset_engine.calculate_fullset_trade(opp, budget)
+
+                print(f"\n   {opp.event_title[:45]}...")
+                print(f"   Outcomes: {opp.num_outcomes} | Edge: {opp.edge_pct:.1f}%")
+                print(f"   Buying all outcomes for ${trade['total_cost']:.2f}")
+
+                # Execute trades for each outcome
+                total_spent = 0
+                for i, (outcome, price, token_id) in enumerate(zip(opp.outcomes, opp.outcome_prices, opp.token_ids)):
+                    qty = trade['quantities'][i]
+                    cost = trade['costs'][i]
+                    if qty > 0 and price > 0 and cost > 0:
+                        # Calculate size_pct based on this outcome's cost
+                        size_pct = cost / trader.portfolio.cash_balance
+                        position, _ = trader.portfolio.execute_simulated_trade(
+                            market_id=opp.event_id,
+                            token_id=token_id,
+                            question=f"{opp.event_title}: {outcome}",
+                            outcome=outcome,
+                            side="BUY",
+                            price=price,
+                            size_pct=size_pct,
+                            trade_id=i
+                        )
+                        if position:
+                            total_spent += position.entry_value
+                arb_trades += 1
+                print(f"   Spent: ${total_spent:.2f} | Guaranteed profit: ${trade['guaranteed_profit']:.2f}")
+
+    elif strategy == 'endgame':
+        print("\n🔄 Running ENDGAME SWEEPS (near-certain outcomes)...")
+        opportunities = trader.endgame_engine.scan_endgame_opportunities(
+            min_price=0.90,
+            max_price=0.99,
+            include_sports=False,
+            limit=args.count * 2
+        )
+
+        if not opportunities:
+            print("   No endgame opportunities found")
+        else:
+            for opp in opportunities[:args.count]:
+                if trader.portfolio.cash_balance < 50:
+                    print(f"\n   Low cash (${trader.portfolio.cash_balance:.2f}), stopping")
+                    break
+
+                print(f"\n   {opp.question[:45]}...")
+                print(f"   {opp.outcome} @ ${opp.price:.4f} | Edge: {opp.edge_pct:.1f}%")
+
+                position, _ = trader.portfolio.execute_simulated_trade(
+                    market_id=opp.market_id,
+                    token_id=opp.token_id,
+                    question=opp.question,
+                    outcome=opp.outcome,
+                    side="BUY",
+                    price=opp.price,
+                    size_pct=0.15,
+                    trade_id=arb_trades
+                )
+                if position:
+                    arb_trades += 1
+                    print(f"   Bought {position.quantity:.2f} shares for ${position.entry_value:.2f}")
+
+    elif strategy == 'oracle':
+        print("\n🔄 Running ORACLE TIMING (price threshold exploits)...")
+        opportunities = trader.oracle_engine.scan_oracle_opportunities(
+            min_edge_pct=args.min_edge,
+            limit=args.count * 2
+        )
+
+        if not opportunities:
+            print("   No oracle timing opportunities found")
+        else:
+            for opp in opportunities[:args.count]:
+                if trader.portfolio.cash_balance < 50:
+                    print(f"\n   Low cash (${trader.portfolio.cash_balance:.2f}), stopping")
+                    break
+
+                budget = min(100, trader.portfolio.cash_balance * 0.15)
+                trade = trader.oracle_engine.calculate_oracle_trade(opp, budget)
+
+                print(f"\n   {opp.question[:45]}...")
+                print(f"   {opp.asset} {opp.threshold_direction} ${opp.threshold_price:,.0f}")
+                print(f"   Current: ${opp.current_price:,.2f} | PM: ${opp.polymarket_price:.4f}")
+
+                position, _ = trader.portfolio.execute_simulated_trade(
+                    market_id=opp.market_id,
+                    token_id=opp.token_id,
+                    question=opp.question,
+                    outcome="Yes",
+                    side="BUY",
+                    price=opp.polymarket_price,
+                    size_pct=0.15,
+                    trade_id=arb_trades
+                )
+                if position:
+                    arb_trades += 1
+                    print(f"   Bought {position.quantity:.2f} shares for ${position.entry_value:.2f}")
+
     if strategy in ['ai', 'mixed']:
         ai_count = args.count if strategy == 'ai' else args.count - arb_trades
         print(f"\n🔄 Running AI trades ({ai_count} trades)...")
@@ -783,8 +895,10 @@ def main():
     auto_parser.add_argument('--count', '-c', type=int, default=3, help='Number of trades to execute (default: 3)')
     auto_parser.add_argument('--take-profit', '-tp', type=float, default=20.0, help='Take profit at X%% gain (default: 20)')
     auto_parser.add_argument('--stop-loss', '-sl', type=float, default=15.0, help='Stop loss at X%% loss (default: 15)')
-    auto_parser.add_argument('--strategy', '-s', choices=['ai', 'arbitrage', 'gabagool', 'mixed'], default='ai', 
-                             help='Trading strategy: ai, arbitrage, gabagool (recommended), mixed')
+    auto_parser.add_argument('--strategy', '-s',
+                             choices=['ai', 'arbitrage', 'gabagool', 'fullset', 'endgame', 'oracle', 'mixed'],
+                             default='ai',
+                             help='Trading strategy: ai, arbitrage, gabagool, fullset, endgame, oracle, mixed')
     auto_parser.add_argument('--min-edge', '-e', type=float, default=0.5, help='Minimum arbitrage edge %% (default: 0.5)')
     
     scan_parser = subparsers.add_parser('scan', help='Scan for arbitrage opportunities', parents=[realistic_parent])
