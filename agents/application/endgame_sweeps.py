@@ -431,7 +431,9 @@ class EndgameSweepEngine:
         exclude_sports: bool = True,
         prefer_political: bool = True,
         min_liquidity: float = 500,
-        limit: int = 10
+        max_days: int = 365,
+        limit: int = 10,
+        sort_by: str = "annualized"  # "edge" or "annualized"
     ) -> List[EndgameOpportunity]:
         """Find the best endgame sweep opportunities."""
 
@@ -440,11 +442,22 @@ class EndgameSweepEngine:
             max_price=max_price,
             exclude_sports=exclude_sports,
             min_liquidity=min_liquidity,
-            limit=limit * 2  # Fetch more to filter
+            limit=limit * 3  # Fetch more to filter
         )
 
-        if prefer_political:
-            # Sort to prioritize political markets
+        # Filter by max days until resolution
+        filtered = []
+        for opp in opportunities:
+            if opp.days_until_resolution is not None and opp.days_until_resolution > max_days:
+                continue
+            filtered.append(opp)
+        opportunities = filtered
+
+        # Sort by chosen metric
+        if sort_by == "annualized":
+            opportunities = sorted(opportunities, key=lambda x: -x.annualized_return)
+        elif prefer_political:
+            # Sort to prioritize political markets, then by edge
             def sort_key(opp):
                 type_priority = {
                     'political': 0,
@@ -456,6 +469,8 @@ class EndgameSweepEngine:
                 return (type_priority.get(opp.market_type, 3), -opp.edge)
 
             opportunities = sorted(opportunities, key=sort_key)
+        else:
+            opportunities = sorted(opportunities, key=lambda x: -x.edge)
 
         return opportunities[:limit]
 

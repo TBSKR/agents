@@ -14,6 +14,11 @@ from dataclasses import dataclass
 import httpx
 
 from agents.polymarket.gamma import GammaMarketClient
+from agents.application.fill_simulator import (
+    FillSimulator,
+    OrderSide,
+    create_market_conditions_from_price
+)
 
 
 @dataclass
@@ -80,6 +85,7 @@ class FullSetArbitrageEngine:
 
     def __init__(self):
         self.gamma = GammaMarketClient()
+        self._fill_simulator = FillSimulator()
 
     def _parse_end_date(self, end_date_str: str) -> Optional[datetime]:
         """Parse end date string to datetime."""
@@ -377,6 +383,58 @@ class FullSetArbitrageEngine:
             'guaranteed_profit': guaranteed_profit,
             'profit_pct': (guaranteed_profit / total_spent) * 100 if total_spent > 0 else 0
         }
+
+    def estimate_realistic_edge(
+        self,
+        opportunity: FullSetOpportunity,
+        budget: float
+    ) -> Tuple[float, float, float]:
+        """
+        Estimate realistic edge after slippage.
+
+        Returns: (raw_profit, realistic_profit, estimated_slippage_pct)
+
+        Note: Returns total profit amounts for the given budget, not per-set edge.
+        """
+        total_slippage_cost = 0.0
+
+        for price, market in zip(opportunity.outcome_prices, opportunity.markets):
+            # Calculate this outcome's order size (dollars spent on this outcome)
+            order_size = (budget / opportunity.total_cost) * price
+
+            # Get liquidity for this market
+            liquidity = float(market.get('liquidityClob', 0) or 0)
+            if liquidity <= 0:
+                liquidity = float(market.get('liquidity', 500) or 500)
+
+            # Get spread
+            spread = float(market.get('spread', 0.02) or 0.02)
+
+            # Create market conditions
+            conditions = create_market_conditions_from_price(
+                price=price,
+                liquidity=liquidity,
+                spread_pct=spread
+            )
+
+            # Calculate slippage for this outcome (as decimal)
+            slippage_rate = self._fill_simulator.calculate_slippage(
+                order_size=order_size,
+                side=OrderSide.BUY,
+                conditions=conditions
+            )
+
+            # Slippage cost = order_size * slippage_rate
+            total_slippage_cost += order_size * slippage_rate
+
+        # Calculate profits
+        num_sets = budget / opportunity.total_cost
+        raw_profit = num_sets * opportunity.edge  # Profit without slippage
+        realistic_profit = raw_profit - total_slippage_cost  # Profit after slippage
+
+        slippage_pct = (total_slippage_cost / budget) * 100 if budget > 0 else 0
+
+        return raw_profit, realistic_profit, slippage_pct
 
     def find_best_opportunities(
         self,

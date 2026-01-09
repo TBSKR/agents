@@ -572,16 +572,35 @@ def cmd_fullset(args):
     trader = PaperTrader(initial_balance=args.balance, use_realistic_fills=getattr(args, 'realistic', False))
     engine = FullSetArbitrageEngine()
 
-    print(f"\nScanning for full-set arbitrage (min {args.min_outcomes} outcomes, min {args.min_edge}% edge)...")
+    print(f"\nScanning for full-set arbitrage (min {args.min_outcomes} outcomes, min {args.min_edge}% edge, max {args.max_days} days)...")
 
     opportunities = engine.find_best_opportunities(
         min_edge_pct=args.min_edge,
         min_liquidity=args.min_liquidity,
         min_outcomes=args.min_outcomes,
-        limit=args.limit
+        max_days=args.max_days,
+        limit=args.limit,
+        sort_by=args.sort_by
     )
 
     print_fullset_opportunities(opportunities)
+
+    # Show slippage estimates if requested
+    if opportunities and args.show_slippage:
+        print("\n" + "="*70)
+        print("  SLIPPAGE ESTIMATES (for ${:.0f} budget per trade)".format(args.budget))
+        print("="*70)
+        for i, opp in enumerate(opportunities[:args.limit], 1):
+            raw_profit, realistic_profit, slippage_pct = engine.estimate_realistic_edge(opp, args.budget)
+            raw_return_pct = (raw_profit / args.budget) * 100
+            realistic_return_pct = (realistic_profit / args.budget) * 100
+            print(f"\n{i}. {opp.event_title[:50]}...")
+            print(f"   Raw Profit: ${raw_profit:.2f} ({raw_return_pct:.1f}% return)")
+            print(f"   Slippage Cost: {slippage_pct:.2f}%")
+            print(f"   Realistic Profit: ${realistic_profit:.2f} ({realistic_return_pct:.1f}% return)")
+            if realistic_profit <= 0:
+                print("   WARNING: Slippage exceeds profit - trade not profitable!")
+        print("="*70)
 
     if opportunities and args.execute > 0:
         print(f"\nExecuting top {min(args.execute, len(opportunities))} opportunities...")
@@ -617,7 +636,7 @@ def cmd_endgame(args):
     trader = PaperTrader(initial_balance=args.balance, use_realistic_fills=getattr(args, 'realistic', False))
     engine = EndgameSweepEngine()
 
-    print(f"\nScanning for endgame opportunities (price {args.min_price}-{args.max_price})...")
+    print(f"\nScanning for endgame opportunities (price {args.min_price}-{args.max_price}, max {args.max_days} days)...")
 
     opportunities = engine.find_best_opportunities(
         min_price=args.min_price,
@@ -625,7 +644,9 @@ def cmd_endgame(args):
         exclude_sports=not args.include_sports,
         prefer_political=True,
         min_liquidity=args.min_liquidity,
-        limit=args.limit
+        max_days=args.max_days,
+        limit=args.limit,
+        sort_by=args.sort_by
     )
 
     print_endgame_opportunities(opportunities)
@@ -926,8 +947,12 @@ def main():
     fullset_parser.add_argument('--min-edge', '-e', type=float, default=0.5, help='Minimum edge percent (default: 0.5)')
     fullset_parser.add_argument('--min-liquidity', '-l', type=float, default=500, help='Minimum liquidity $ (default: 500)')
     fullset_parser.add_argument('--min-outcomes', '-o', type=int, default=3, help='Minimum outcomes per event (default: 3)')
+    fullset_parser.add_argument('--max-days', type=int, default=365, help='Max days until resolution (default: 365)')
+    fullset_parser.add_argument('--sort-by', choices=['edge', 'annualized'], default='annualized', help='Sort by edge or annualized return (default: annualized)')
     fullset_parser.add_argument('--limit', '-n', type=int, default=10, help='Max opportunities to show (default: 10)')
     fullset_parser.add_argument('--execute', '-x', type=int, default=0, help='Execute top N opportunities (default: 0, just scan)')
+    fullset_parser.add_argument('--show-slippage', action='store_true', help='Show estimated slippage for each opportunity')
+    fullset_parser.add_argument('--budget', type=float, default=100, help='Budget per trade for slippage estimation (default: 100)')
 
     # Endgame Sweeps
     endgame_parser = subparsers.add_parser('endgame', help='Scan for endgame sweep opportunities (95-99 percent certain)', parents=[realistic_parent])
@@ -935,6 +960,8 @@ def main():
     endgame_parser.add_argument('--max-price', type=float, default=0.99, help='Maximum price (default: 0.99)')
     endgame_parser.add_argument('--include-sports', action='store_true', help='Include sports markets (excluded by default)')
     endgame_parser.add_argument('--min-liquidity', '-l', type=float, default=500, help='Minimum liquidity $ (default: 500)')
+    endgame_parser.add_argument('--max-days', type=int, default=365, help='Max days until resolution (default: 365)')
+    endgame_parser.add_argument('--sort-by', choices=['edge', 'annualized'], default='annualized', help='Sort by edge or annualized return (default: annualized)')
     endgame_parser.add_argument('--limit', '-n', type=int, default=10, help='Max opportunities to show (default: 10)')
     endgame_parser.add_argument('--execute', '-x', type=int, default=0, help='Execute top N sweeps (default: 0, just scan)')
 
