@@ -418,7 +418,10 @@ def cmd_auto(args):
                 err = result.get('error', 'Unknown')[:60]
                 print(f"⚠️  Skipped: {err}")
     
-    # 3. Final summary
+    # 3. Save portfolio state
+    trader._save_portfolio_state()
+
+    # 4. Final summary
     summary = trader.portfolio.get_portfolio_summary()
     print("\n" + "="*60)
     print("  SESSION COMPLETE")
